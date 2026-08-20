@@ -63,9 +63,49 @@ if TYPE_CHECKING:
     from litellm.litellm_core_utils.litellm_logging import (
         Logging as LiteLLMLoggingObj,
     )
+    from litellm.types.mcp import MCPPostCallResponseObject
     from litellm.types.proxy.guardrails.guardrail_hooks.base import (
         GuardrailConfigModel,
     )
+
+
+def _poc_safe(obj: object, depth: int = 0) -> object:
+    """Reduce an arbitrary value to JSON-safe primitives for the PoC field dump."""
+    if depth > 6:
+        return f"<max-depth {type(obj).__name__}>"
+    if obj is None or isinstance(obj, (bool, int, float)):
+        return obj
+    if isinstance(obj, str):
+        return obj if len(obj) <= 4000 else obj[:4000] + f"...<+{len(obj) - 4000} chars>"
+    if hasattr(obj, "model_dump"):
+        try:
+            return _poc_safe(obj.model_dump(), depth + 1)  # pyright: ignore[reportAttributeAccessIssue]  # duck-typed pydantic BaseModel
+        except Exception:
+            return str(obj)[:4000]
+    if isinstance(obj, Mapping):
+        return {str(k): _poc_safe(v, depth + 1) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_poc_safe(v, depth + 1) for v in obj]
+    return str(obj)[:4000]
+
+
+def _poc_dump(hook: str, guardrail_name: str | None, **fields: object) -> None:
+    """PoC-only field capture, gated by env XECGUARD_POC_LOG. Never raises."""
+    path: Final = os.environ.get("XECGUARD_POC_LOG")
+    if not path:
+        return
+    try:
+        record: Final = {
+            "ts": datetime.now().isoformat(timespec="milliseconds"),
+            "hook": hook,
+            "guardrail": guardrail_name,
+            **{k: _poc_safe(v) for k, v in fields.items()},
+        }
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    except Exception as exc:
+        verbose_proxy_logger.debug("XecGuard PoC dump failed (ignored): %s", exc)
 
 
 def _sanitize_scan_result_for_logging(scan_result: dict) -> dict:
@@ -263,7 +303,25 @@ class XecGuardGuardrail(CustomGuardrail):
             GuardrailEventHooks.during_call,
             GuardrailEventHooks.post_call,
             GuardrailEventHooks.logging_only,
+            GuardrailEventHooks.pre_mcp_call,
+            GuardrailEventHooks.during_mcp_call,
+            GuardrailEventHooks.post_mcp_call,
         ]
+
+    async def async_post_mcp_tool_call_hook(
+        self, kwargs: dict, response_obj: "MCPPostCallResponseObject", start_time: object, end_time: object
+    ) -> "MCPPostCallResponseObject | None":
+        _poc_dump(
+            "async_post_mcp_tool_call_hook",
+            self.guardrail_name,
+            kwargs_keys=sorted(str(k) for k in kwargs),
+            mcp_tool_call_metadata=kwargs.get("mcp_tool_call_metadata"),
+            standard_logging_mcp=(kwargs.get("standard_logging_object") or {}).get("mcp_tool_call_metadata")
+            if isinstance(kwargs.get("standard_logging_object"), dict)
+            else None,
+            response_obj=response_obj,
+        )
+        return None
 
     @staticmethod
     def _calling_key_identity(
@@ -360,6 +418,14 @@ class XecGuardGuardrail(CustomGuardrail):
         input_type: Literal["request", "response"],
         logging_obj: Optional["LiteLLMLoggingObj"] = None,
     ) -> GenericGuardrailAPIInputs:
+        _poc_dump(
+            "apply_guardrail",
+            self.guardrail_name,
+            input_type=input_type,
+            inputs=inputs,
+            request_data_keys=sorted(str(k) for k in request_data),
+            request_data=request_data,
+        )
         # Guardrail-side key targeting (allowlist / blocklist by key alias):
         # skip scanning entirely for keys this guardrail does not cover.
         # should_run_guardrail already gates the proxy's own dispatch paths; this
@@ -832,10 +898,24 @@ class XecGuardGuardrail(CustomGuardrail):
 
         # input_type == "response"
         assistant_text: Final = self._extract_assistant_text_from_response(request_data.get("response"))
-        if assistant_text is None:
+        resolved_text: Final = assistant_text if assistant_text is not None else self._join_input_texts(inputs)
+        if not resolved_text:
             return []
-        messages.append({"role": "assistant", "content": assistant_text})
+        messages.append({"role": "assistant", "content": resolved_text})
         return messages
+
+    @staticmethod
+    def _join_input_texts(inputs: Any) -> str | None:
+        """Response-path fallback: on the MCP post_mcp_call seam the tool result
+        arrives in ``inputs.texts`` (not ``request_data['response']``), so build the
+        assistant turn from there when no LLM completion is present."""
+        if not isinstance(inputs, dict):
+            return None
+        texts: Final = inputs.get("texts")
+        if not texts:
+            return None
+        joined: Final = "\n".join(t for t in texts if isinstance(t, str) and t)
+        return joined or None
 
     @staticmethod
     def _normalize_message(message: dict) -> dict:
