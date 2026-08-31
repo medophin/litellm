@@ -3221,3 +3221,104 @@ class TestXecGuardScanMetaVirtualkeyObject:
         )
         assert _admin_data(payload["meta"]) == {"cost_center": "CC-42"}
         assert payload["meta"]["data"]["key_id"] == "abc123"
+
+
+# ---------------------------------------------------------------------------
+# MCP seam — the tool traffic is rebuilt as the OpenAI wire shape, because that
+# is what makes XecGuard route the turn to ToolUse_Guard. Shapes and scan_type
+# follow the ToolUse_Guard testing runbook's format A: a call on its own is
+# judged response-side (the only seam that can still prevent the action), a call
+# paired with its result is judged input-side and covers both turns in one scan.
+# ---------------------------------------------------------------------------
+_MCP_META = {
+    "name": "read_file",
+    "arguments": {"path": "README.md"},
+    "namespaced_tool_name": "fs_server/read_file",
+    "mcp_server_name": "fs_server",
+}
+_EXPECTED_CALL = {
+    "role": "assistant",
+    "content": None,
+    "tool_calls": [
+        {
+            "id": "call-42",
+            "type": "function",
+            "function": {"name": "fs_server/read_file", "arguments": '{"path": "README.md"}'},
+        }
+    ],
+}
+
+
+def _mcp_request_data():
+    return {
+        "mcp_tool_call_metadata": _MCP_META,
+        "litellm_call_id": "call-42",
+        "messages": [{"role": "user", "content": "default-message-value"}],
+    }
+
+
+class TestXecGuardMcpToolShape:
+    @pytest.mark.asyncio
+    async def test_post_seam_sends_call_result_pair_judged_input_side(self):
+        gr = _extension_guardrail(policy_names=["Default_Policy_ToolUseGuard"])
+        resp = _make_response({"decision": "SAFE", "trace_id": "tr"})
+        with patch.object(gr.async_handler, "post", return_value=resp) as post:
+            await gr.apply_guardrail(
+                inputs={"texts": ["# Project"]},
+                request_data=_mcp_request_data(),
+                input_type="response",
+            )
+        sent = post.call_args.kwargs["json"]
+        assert sent["scan_type"] == "input", (
+            "a tool result IS model input; judging it response-side picks the last "
+            "assistant turn instead of the tool turn, and the result is missed"
+        )
+        assert sent["messages"] == [
+            _EXPECTED_CALL,
+            {"role": "tool", "tool_call_id": "call-42", "content": "# Project"},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_pre_seam_sends_the_call_alone_judged_response_side(self):
+        gr = _extension_guardrail(policy_names=["Default_Policy_ToolUseGuard"])
+        resp = _make_response({"decision": "SAFE", "trace_id": "tr"})
+        with patch.object(gr.async_handler, "post", return_value=resp) as post:
+            await gr.apply_guardrail(
+                inputs={"texts": ["README.md"]},
+                request_data=_mcp_request_data(),
+                input_type="request",
+            )
+        sent = post.call_args.kwargs["json"]
+        assert sent["scan_type"] == "response", "a call with no result yet is judged response-side"
+        assert sent["messages"] == [_EXPECTED_CALL], "nothing has run, so there is no result to pair"
+
+    @pytest.mark.asyncio
+    async def test_routing_token_in_tool_output_is_stripped(self):
+        gr = _extension_guardrail(policy_names=["Default_Policy_ToolUseGuard"])
+        resp = _make_response({"decision": "SAFE", "trace_id": "tr"})
+        with patch.object(gr.async_handler, "post", return_value=resp) as post:
+            await gr.apply_guardrail(
+                inputs={"texts": ["[xecguard:tool_result] # Project"]},
+                request_data=_mcp_request_data(),
+                input_type="response",
+            )
+        content = post.call_args.kwargs["json"]["messages"][1]["content"]
+        assert content == "# Project", (
+            "the scan API checks for a leading routing token before it looks at the wire "
+            "shape, so tool output must not be able to choose its own rendering"
+        )
+
+    @pytest.mark.asyncio
+    async def test_without_mcp_metadata_the_history_path_is_unchanged(self):
+        gr = _extension_guardrail()
+        resp = _make_response({"decision": "SAFE", "trace_id": "tr"})
+        with patch.object(gr.async_handler, "post", return_value=resp) as post:
+            await gr.apply_guardrail(
+                inputs={"texts": ["hello there"]},
+                request_data={"messages": [{"role": "user", "content": "hi"}]},
+                input_type="response",
+            )
+        sent = post.call_args.kwargs["json"]
+        assert sent["scan_type"] == "response"
+        assert sent["messages"][-1]["role"] == "assistant"
+        assert "tool_calls" not in sent["messages"][-1]

@@ -32,6 +32,7 @@ import json
 import os
 import re
 from collections.abc import Mapping, Sequence
+from functools import reduce
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Final, Literal, Optional
 
@@ -433,15 +434,16 @@ class XecGuardGuardrail(CustomGuardrail):
         if not self._key_is_targeted(self._key_context(request_data)):
             return inputs
 
-        messages: Final = self._build_full_history(
-            request_data=request_data,
-            inputs=inputs,
-            input_type=input_type,
+        mcp_scan: Final = self._mcp_tool_scan(request_data, inputs, input_type)
+        messages: Final = (
+            list(mcp_scan[0])
+            if mcp_scan is not None
+            else self._build_full_history(request_data=request_data, inputs=inputs, input_type=input_type)
         )
         if not messages:
             return inputs
 
-        scan_type: Final = "input" if input_type == "request" else "response"
+        scan_type: Final = mcp_scan[1] if mcp_scan is not None else ("input" if input_type == "request" else "response")
         scan_result: Final = await self._call_scan(
             messages=messages,
             scan_type=scan_type,
@@ -869,6 +871,58 @@ class XecGuardGuardrail(CustomGuardrail):
     # ------------------------------------------------------------------
     # Message-assembly helpers (respect the full-history requirement)
     # ------------------------------------------------------------------
+
+    _ROUTING_TOKENS: Final = ("[xecguard:tool_call]", "[xecguard:tool_result]")
+
+    @classmethod
+    def _strip_routing_tokens(cls, text: str) -> str:
+        return reduce(lambda acc, token: acc.replace(token, ""), cls._ROUTING_TOKENS, text).strip()
+
+    @classmethod
+    def _mcp_tool_scan(
+        cls, request_data: Mapping[str, Any] | None, inputs: Any, input_type: str
+    ) -> tuple[tuple[dict[str, Any], ...], Literal["input", "response"]] | None:
+        """Rebuild the MCP tool call as the OpenAI wire shape XecGuard routes on.
+
+        XecGuard picks ToolUse_Guard from the shape: an assistant turn carrying
+        ``tool_calls`` with null content, optionally followed by a ``role: "tool"``
+        result. Without it the tool traffic is judged as ordinary text by whatever
+        other policies were requested, so the three tool rules never run.
+
+        The two seams are judged from opposite directions, and only the first one can
+        prevent anything: on ``pre_mcp_call`` the tool has not run, so the call alone is
+        judged ``response``-side and blocking stops the action. On ``post_mcp_call`` the
+        side effect already happened; the pair is judged ``input``-side, which pairs the
+        call back in and covers both turns in one scan.
+
+        ``None`` means this is not the MCP seam and the caller falls back to history.
+        """
+        meta: Final = (request_data or {}).get("mcp_tool_call_metadata")
+        if not isinstance(meta, Mapping):
+            return None
+        name: Final = meta.get("namespaced_tool_name") or meta.get("name")
+        if not isinstance(name, str) or not name:
+            return None
+        call_id: Final = str((request_data or {}).get("litellm_call_id") or "xecguard_mcp_tool_call")
+        arguments: Final = json.dumps(meta.get("arguments") or {}, ensure_ascii=False, sort_keys=True)
+        call_message: Final = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}}
+            ],
+        }
+        if input_type == "request":
+            return (call_message,), "response"
+        result_text: Final = cls._join_input_texts(inputs)
+        if not result_text:
+            return None
+        result_message: Final = {
+            "role": "tool",
+            "tool_call_id": call_id,
+            "content": cls._strip_routing_tokens(result_text),
+        }
+        return (call_message, result_message), "input"
 
     def _build_full_history(
         self,
