@@ -35,6 +35,9 @@ export const requiredRule = (message: string): GuardrailFieldRules => ({
 export const asText = (value: unknown): string => {
   if (typeof value === "string") return value;
   if (typeof value === "number") return String(value);
+  if (Array.isArray(value)) {
+    return value.filter((entry): entry is string => typeof entry === "string").join(", ");
+  }
   return "";
 };
 
