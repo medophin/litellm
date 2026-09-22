@@ -195,7 +195,8 @@ model_list:
   - model_name: gpt-4o-mini
     litellm_params:
       model: openai/gpt-4o-mini
-      api_key: os.environ/OPENAI_API_KEY
+      api_key: os.environ/ANTHROPIC_API_KEY
+      api_base: https://llm-proxy.cycraft.ai
 
 general_settings:
   master_key: sk-1234
@@ -218,3 +219,20 @@ litellm_settings:
     sandbox_tool_name: e2b_sandbox
   callbacks:
     - code_interpreter_interception
+
+guardrails:
+  - guardrail_name: "xecguard-mainline-stream"
+    litellm_params:
+      guardrail: xecguard
+      mode: post_call
+      api_key: os.environ/XECGUARD_API_KEY
+      api_base: https://api-staging-xec.cycraft.ai/
+      default_on: false
+      stream_mode: window
+      stream_chunk: 5
+      stream_context: 2
+      stream_first: true
+      policy_names:
+        - Default_Policy_SystemPromptEnforcement
+        - Default_Policy_PIISensitiveDataProtection
+        - Default_Policy_GeneralPromptAttackProtection

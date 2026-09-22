@@ -7,12 +7,13 @@ suite lives in ``test_xecguard_live.py``.
 """
 
 import os
-from unittest.mock import MagicMock, patch
+from collections.abc import AsyncGenerator
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-
 from fastapi.exceptions import HTTPException
+
 from litellm.proxy.guardrails.guardrail_hooks.xecguard.xecguard import (
     XecGuardGuardrail,
     XecGuardMissingCredentials,
@@ -20,6 +21,7 @@ from litellm.proxy.guardrails.guardrail_hooks.xecguard.xecguard import (
 from litellm.types.proxy.guardrails.guardrail_hooks.xecguard import (
     XecGuardConfigModel,
 )
+from litellm.types.utils import Delta, ModelResponseStream, StreamingChoices
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -68,6 +70,32 @@ def _build_model_response(content: str) -> MagicMock:
     response = MagicMock()
     response.choices = [choice]
     return response
+
+
+def _stream_chunk(content: str, finish_reason: str | None = None) -> ModelResponseStream:
+    return ModelResponseStream(
+        id="chatcmpl-test",
+        created=1234,
+        model="gpt-4o-mini",
+        choices=[
+            StreamingChoices(
+                index=0,
+                delta=Delta(role="assistant", content=content),
+                finish_reason=finish_reason,
+            )
+        ],
+    )
+
+
+async def _fake_stream(pieces: list, tracker: list | None = None) -> AsyncGenerator[ModelResponseStream, None]:
+    """Async generator of streaming chunks. ``tracker`` (if given) records
+    every piece actually pulled, so a test can assert the upstream
+    generator stopped being consumed after a mid-stream block."""
+    for i, piece in enumerate(pieces):
+        if tracker is not None:
+            tracker.append(piece)
+        is_last = i == len(pieces) - 1
+        yield _stream_chunk(piece, finish_reason="stop" if is_last else None)
 
 
 # ---------------------------------------------------------------------------
@@ -1884,6 +1912,207 @@ class TestXecGuardLoggingHook:
 
 
 # ---------------------------------------------------------------------------
+# Streaming (post_call)
+# ---------------------------------------------------------------------------
+
+
+class TestXecGuardStreaming:
+    def test_streaming_config_defaults(self, xecguard_guardrail):
+        assert xecguard_guardrail.stream_mode == "window"
+        assert xecguard_guardrail.stream_chunk == 40
+        assert xecguard_guardrail.stream_context == 10
+        assert xecguard_guardrail.stream_first is True
+
+    def test_streaming_hook_is_own_override(self, xecguard_guardrail):
+        """The dispatch classification in ``ProxyLogging._callback_capabilities``
+        tags a guardrail as streaming "override" purely from
+        ``"async_post_call_streaming_iterator_hook" in cls.__dict__``, and this
+        must stay independent of ``use_native_lifecycle_hooks`` so pre_call /
+        during_call / non-streaming post_call keep going through
+        ``unified_guardrail``. Guard both invariants directly.
+        """
+        assert "async_post_call_streaming_iterator_hook" in XecGuardGuardrail.__dict__
+        assert getattr(xecguard_guardrail, "use_native_lifecycle_hooks", False) is False
+
+    @pytest.mark.asyncio
+    async def test_window_mode_safe_passes_all_chunks_through(self, mock_request_data):
+        guardrail = XecGuardGuardrail(
+            api_key="xgs_test",
+            stream_mode="window",
+            stream_chunk=2,
+            stream_context=1,
+        )
+        with patch.object(
+            guardrail, "_call_scan", new=AsyncMock(return_value={"decision": "SAFE"})
+        ) as mock_scan:
+            out = [
+                chunk
+                async for chunk in guardrail.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=MagicMock(),
+                    response=_fake_stream(["a", "b", "c", "d"]),
+                    request_data=mock_request_data,
+                )
+            ]
+        assert [c.choices[0].delta.content for c in out] == ["a", "b", "c", "d"]
+        assert mock_scan.call_count == 2  # scans trigger at 2 and 4 deltas; no leftover tail
+
+    @pytest.mark.asyncio
+    async def test_window_mode_unsafe_cuts_stream_mid_flight(self, mock_request_data):
+        guardrail = XecGuardGuardrail(
+            api_key="xgs_test",
+            stream_mode="window",
+            stream_chunk=2,
+            stream_context=1,
+        )
+        scan_results = [
+            {"decision": "SAFE"},
+            {
+                "decision": "UNSAFE",
+                "trace_id": "trace-stream",
+                "xecguard_result": [
+                    {"violated_policy_name": "Default_Policy_HarmfulContentProtection", "rationale": "bad"}
+                ],
+            },
+        ]
+        tracker: list = []
+        with patch.object(guardrail, "_call_scan", new=AsyncMock(side_effect=scan_results)):
+            out = [
+                chunk
+                async for chunk in guardrail.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=MagicMock(),
+                    response=_fake_stream(["a", "b", "c", "d", "e", "f"], tracker=tracker),
+                    request_data=mock_request_data,
+                )
+            ]
+        # Only the first window's 2 deltas + the synthetic block chunk were emitted;
+        # the generator must not keep pulling upstream chunks past the cut.
+        assert len(tracker) == 4  # stream_first releases each delta as it's pulled, before the 2nd scan
+        assert out[-1].choices[0].finish_reason == "content_filter"
+        assert "trace-stream" in out[-1].choices[0].delta.content
+        assert "Default_Policy_HarmfulContentProtection" in out[-1].choices[0].delta.content
+
+    @pytest.mark.asyncio
+    async def test_window_mode_audit_never_blocks(self, mock_request_data):
+        guardrail = XecGuardGuardrail(
+            api_key="xgs_test",
+            stream_mode="audit",
+            stream_chunk=2,
+            stream_context=1,
+        )
+        with patch.object(
+            guardrail, "_call_scan", new=AsyncMock(return_value={"decision": "UNSAFE", "trace_id": "t"})
+        ) as mock_scan:
+            out = [
+                chunk
+                async for chunk in guardrail.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=MagicMock(),
+                    response=_fake_stream(["a", "b", "c", "d"]),
+                    request_data=mock_request_data,
+                )
+            ]
+        # Every delta is delivered untouched even though every scan says UNSAFE.
+        assert [c.choices[0].delta.content for c in out] == ["a", "b", "c", "d"]
+        assert mock_scan.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_window_mode_scan_error_fails_open(self, mock_request_data):
+        """XecGuard being unreachable must never block a stream in window
+        mode, regardless of ``block_on_error`` - this is what distinguishes
+        it from buffer mode's error handling."""
+        guardrail = XecGuardGuardrail(
+            api_key="xgs_test",
+            stream_mode="window",
+            stream_chunk=2,
+            stream_context=1,
+            block_on_error=True,
+        )
+        with patch.object(
+            guardrail.async_handler, "post", side_effect=httpx.ConnectError("refused")
+        ):
+            out = [
+                chunk
+                async for chunk in guardrail.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=MagicMock(),
+                    response=_fake_stream(["a", "b", "c", "d"]),
+                    request_data=mock_request_data,
+                )
+            ]
+        assert [c.choices[0].delta.content for c in out] == ["a", "b", "c", "d"]
+        assert out[-1].choices[0].finish_reason != "content_filter"
+
+    @pytest.mark.asyncio
+    async def test_window_mode_stream_first_false_holds_until_scanned(self, mock_request_data):
+        guardrail = XecGuardGuardrail(
+            api_key="xgs_test",
+            stream_mode="window",
+            stream_chunk=2,
+            stream_context=1,
+            stream_first=False,
+        )
+        with patch.object(guardrail, "_call_scan", new=AsyncMock(return_value={"decision": "SAFE"})):
+            out = [
+                chunk
+                async for chunk in guardrail.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=MagicMock(),
+                    response=_fake_stream(["a", "b", "c", "d"]),
+                    request_data=mock_request_data,
+                )
+            ]
+        # Content is preserved and in order even though release is deferred to scan boundaries.
+        assert [c.choices[0].delta.content for c in out] == ["a", "b", "c", "d"]
+
+    @pytest.mark.asyncio
+    async def test_buffer_mode_safe_reemits_assembled_response(self, mock_request_data):
+        guardrail = XecGuardGuardrail(api_key="xgs_test", stream_mode="buffer")
+        with patch.object(
+            guardrail, "_call_scan", new=AsyncMock(return_value={"decision": "SAFE"})
+        ) as mock_scan:
+            out = [
+                chunk
+                async for chunk in guardrail.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=MagicMock(),
+                    response=_fake_stream(["Hello ", "world"]),
+                    request_data=mock_request_data,
+                )
+            ]
+        combined = "".join(c.choices[0].delta.content or "" for c in out if c.choices)
+        assert combined == "Hello world"
+        mock_scan.assert_called_once()
+        assert mock_scan.call_args.kwargs["messages"][-1] == {
+            "role": "assistant",
+            "content": "Hello world",
+        }
+
+    @pytest.mark.asyncio
+    async def test_buffer_mode_unsafe_blocks_without_leaking_content(self, mock_request_data):
+        guardrail = XecGuardGuardrail(api_key="xgs_test", stream_mode="buffer")
+        with patch.object(
+            guardrail,
+            "_call_scan",
+            new=AsyncMock(
+                return_value={
+                    "decision": "UNSAFE",
+                    "trace_id": "trace-buf",
+                    "xecguard_result": [{"violated_policy_name": "PolicyX", "rationale": "bad"}],
+                }
+            ),
+        ):
+            out = [
+                chunk
+                async for chunk in guardrail.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=MagicMock(),
+                    response=_fake_stream(["secret ", "content"]),
+                    request_data=mock_request_data,
+                )
+            ]
+        assert len(out) == 1
+        assert out[0].choices[0].finish_reason == "content_filter"
+        # The original (unsafe) text must never appear in what's yielded.
+        assert "secret" not in out[0].choices[0].delta.content
+        assert "trace-buf" in out[0].choices[0].delta.content
+
+
+# ---------------------------------------------------------------------------
 # Config model + registry
 # ---------------------------------------------------------------------------
 
@@ -1900,6 +2129,10 @@ class TestXecGuardConfigModel:
         assert model.policy_names is None
         assert model.block_on_error is None
         assert model.grounding_strictness is None
+        assert model.stream_mode is None
+        assert model.stream_chunk is None
+        assert model.stream_context is None
+        assert model.stream_first is None
 
     def test_get_config_model_from_guardrail(self, xecguard_guardrail):
         cfg = xecguard_guardrail.get_config_model()
@@ -1975,3 +2208,45 @@ class TestXecGuardInitializer:
         assert isinstance(cb, XecGuardGuardrail)
         assert cb.api_key == "xgs_init"
         assert cb.guardrail_name == "xg-test"
+
+    def test_initializer_forwards_streaming_params(self):
+        """Regression guard: ``initialize_guardrail`` hand-lists which
+        ``LitellmParams`` fields reach ``XecGuardGuardrail.__init__``. A
+        streaming field added to ``XecGuardConfigModel`` but not to this
+        allowlist is silently dropped - the guardrail then runs with the
+        wrong stream_chunk/stream_context, and nothing about that shows up
+        in a test that constructs ``XecGuardGuardrail`` directly (only the
+        config.yaml -> initializer -> instance path exercises it).
+        """
+        from litellm.proxy.guardrails.guardrail_hooks.xecguard import (
+            initialize_guardrail,
+        )
+        from litellm.types.guardrails import LitellmParams
+
+        params = LitellmParams(
+            guardrail="xecguard",
+            mode="post_call",
+            api_key="xgs_init",
+            stream_mode="buffer",
+            stream_chunk=5,
+            stream_context=2,
+            stream_first=False,
+        )
+        cb = initialize_guardrail(litellm_params=params, guardrail={"guardrail_name": "xg-stream"})
+        assert cb.stream_mode == "buffer"
+        assert cb.stream_chunk == 5
+        assert cb.stream_context == 2
+        assert cb.stream_first is False
+
+    def test_initializer_streaming_params_default_when_unset(self):
+        from litellm.proxy.guardrails.guardrail_hooks.xecguard import (
+            initialize_guardrail,
+        )
+        from litellm.types.guardrails import LitellmParams
+
+        params = LitellmParams(guardrail="xecguard", mode="post_call", api_key="xgs_init")
+        cb = initialize_guardrail(litellm_params=params, guardrail={"guardrail_name": "xg-stream-default"})
+        assert cb.stream_mode == "window"
+        assert cb.stream_chunk == 40
+        assert cb.stream_context == 10
+        assert cb.stream_first is True

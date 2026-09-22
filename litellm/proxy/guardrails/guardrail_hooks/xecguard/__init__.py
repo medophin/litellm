@@ -21,6 +21,10 @@ def initialize_guardrail(
         policy_names=litellm_params.policy_names,
         block_on_error=litellm_params.block_on_error,
         grounding_strictness=litellm_params.grounding_strictness,
+        stream_mode=litellm_params.stream_mode or "window",
+        stream_chunk=litellm_params.stream_chunk or 40,
+        stream_context=litellm_params.stream_context or 10,
+        stream_first=litellm_params.stream_first if litellm_params.stream_first is not None else True,
         guardrail_name=guardrail.get(
             "guardrail_name",
             "",

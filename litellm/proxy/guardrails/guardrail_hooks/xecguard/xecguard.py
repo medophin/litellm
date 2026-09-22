@@ -20,10 +20,17 @@ Design notes (intentional divergences from the framework defaults):
     directly for ``logging_only`` mode - it does NOT bridge to
     ``apply_guardrail``. Our override runs the scan non-blockingly and
     swallows every exception.
+  * ``async_post_call_streaming_iterator_hook`` is defined directly on this
+    class (not via ``use_native_lifecycle_hooks``) so it is picked up as an
+    "override" callback purely by having its own entry in the class's
+    ``__dict__`` (see ``ProxyLogging._callback_capabilities``). pre_call,
+    during_call and non-streaming post_call keep going through the generic
+    ``apply_guardrail``/``unified_guardrail`` dispatch untouched.
 """
 
 import asyncio
 import os
+from collections.abc import AsyncGenerator
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Final, Literal, Optional
 
@@ -42,15 +49,20 @@ from litellm.llms.custom_httpx.http_handler import (
 )
 from litellm.types.guardrails import GuardrailEventHooks
 from litellm.types.utils import (
+    Delta,
     GenericGuardrailAPIInputs,
     GuardrailStatus,
+    ModelResponse,
+    ModelResponseStream,
     StandardLoggingGuardrailInformation,
+    StreamingChoices,
 )
 
 if TYPE_CHECKING:
     from litellm.litellm_core_utils.litellm_logging import (
         Logging as LiteLLMLoggingObj,
     )
+    from litellm.proxy._types import UserAPIKeyAuth
     from litellm.types.proxy.guardrails.guardrail_hooks.base import (
         GuardrailConfigModel,
     )
@@ -90,6 +102,10 @@ class XecGuardGuardrail(CustomGuardrail):
         policy_names: list[str] | None = None,
         block_on_error: bool | None = None,
         grounding_strictness: str | None = None,
+        stream_mode: Literal["window", "buffer", "audit"] = "window",
+        stream_chunk: int = 40,
+        stream_context: int = 10,
+        stream_first: bool = True,
         **kwargs: Any,
     ) -> None:
         self.api_key = api_key or os.environ.get("XECGUARD_API_KEY")
@@ -117,6 +133,11 @@ class XecGuardGuardrail(CustomGuardrail):
             self.block_on_error = block_on_error
 
         self.grounding_strictness = grounding_strictness or _DEFAULT_GROUNDING_STRICTNESS
+
+        self.stream_mode = stream_mode
+        self.stream_chunk = max(1, stream_chunk)
+        self.stream_context = max(0, stream_context)
+        self.stream_first = stream_first
 
         self.async_handler = get_async_httpx_client(
             llm_provider=httpxSpecialProvider.GuardrailCallback,
@@ -299,6 +320,147 @@ class XecGuardGuardrail(CustomGuardrail):
                 str(exc),
             )
         return kwargs, result
+
+    # ------------------------------------------------------------------
+    # Streaming (post_call): self-contained, does not use apply_guardrail
+    # ------------------------------------------------------------------
+
+    async def async_post_call_streaming_iterator_hook(
+        self,
+        user_api_key_dict: "UserAPIKeyAuth",
+        response: Any,
+        request_data: dict,
+    ) -> AsyncGenerator[ModelResponseStream, None]:
+        """Streaming-output scan, mode chosen by ``stream_mode``.
+
+        - ``window``: rolling-window scan every ``stream_chunk`` deltas
+          (``stream_context`` overlap deltas + new ones); UNSAFE cuts the
+          stream mid-flight. ``stream_first`` (default True) releases each
+          delta before it's covered by a scan (matches NeMo's default);
+          scan errors fail open (never block on a XecGuard outage).
+        - ``buffer``: collect the whole stream, scan once, then re-emit.
+          Zero leak, no token-by-token feel. Scan errors respect
+          ``block_on_error`` like every other non-streaming scan.
+        - ``audit``: same cadence as ``window`` but never acts on UNSAFE -
+          for observing what the window scan would have done.
+        """
+        if self.stream_mode == "buffer":
+            async for chunk in self._buffer_all_and_scan(response=response, request_data=request_data):
+                yield chunk
+            return
+        async for chunk in self._window_scan_stream(
+            response=response,
+            request_data=request_data,
+            audit_only=self.stream_mode == "audit",
+        ):
+            yield chunk
+
+    @staticmethod
+    def _chunk_delta_text(chunk: Any) -> str:
+        choices: Final = getattr(chunk, "choices", None) or []
+        if not choices:
+            return ""
+        delta: Final = getattr(choices[0], "delta", None)
+        content: Final = getattr(delta, "content", None) if delta is not None else None
+        return content if isinstance(content, str) else ""
+
+    def _build_block_stream_chunk(self, scan_result: dict) -> ModelResponseStream:
+        notice: Final = f"\n\n[Blocked by XecGuard] {self._format_scan_block_message(scan_result)}"
+        return ModelResponseStream(
+            choices=[
+                StreamingChoices(
+                    index=0,
+                    delta=Delta(role="assistant", content=notice),
+                    finish_reason="content_filter",
+                )
+            ]
+        )
+
+    async def _scan_stream_window(
+        self,
+        base_messages: list[dict],
+        pieces: list[str],
+        scanned: int,
+    ) -> dict | None:
+        new_pieces: Final = pieces[scanned:]
+        if not new_pieces:
+            return None
+        overlap_start: Final = max(0, scanned - self.stream_context)
+        window_text: Final = "".join(pieces[overlap_start:scanned]) + "".join(new_pieces)
+        messages: Final = [*base_messages, {"role": "assistant", "content": window_text}]
+        return await self._call_scan(messages=messages, scan_type="response", suppress_errors=True)
+
+    async def _window_scan_stream(
+        self,
+        response: Any,
+        request_data: dict,
+        audit_only: bool,
+    ) -> AsyncGenerator[ModelResponseStream, None]:
+        base_messages: Final = self._build_full_history(request_data=request_data, inputs={}, input_type="request")
+        pieces: Final[list[str]] = []
+        held: Final[list[ModelResponseStream]] = []
+        scanned = 0
+
+        async for chunk in response:
+            pieces.append(self._chunk_delta_text(chunk))
+            if self.stream_first:
+                yield chunk
+            else:
+                held.append(chunk)
+
+            if len(pieces) - scanned < self.stream_chunk:
+                continue
+
+            result = await self._scan_stream_window(base_messages=base_messages, pieces=pieces, scanned=scanned)
+            if result is not None and result.get("decision") == "UNSAFE" and not audit_only:
+                yield self._build_block_stream_chunk(result)
+                return
+            scanned = len(pieces)
+            if not self.stream_first:
+                for held_chunk in held:
+                    yield held_chunk
+                held.clear()
+
+        result = await self._scan_stream_window(base_messages=base_messages, pieces=pieces, scanned=scanned)
+        if result is not None and result.get("decision") == "UNSAFE" and not audit_only:
+            yield self._build_block_stream_chunk(result)
+            return
+        if not self.stream_first:
+            for held_chunk in held:
+                yield held_chunk
+
+    async def _buffer_all_and_scan(
+        self,
+        response: Any,
+        request_data: dict,
+    ) -> AsyncGenerator[ModelResponseStream, None]:
+        from litellm.llms.base_llm.base_model_iterator import MockResponseIterator
+        from litellm.main import stream_chunk_builder
+
+        all_chunks: Final[list[ModelResponseStream]] = []
+        async for chunk in response:
+            all_chunks.append(chunk)
+
+        assembled: Final = stream_chunk_builder(chunks=all_chunks)
+        if not isinstance(assembled, ModelResponse):
+            for chunk in all_chunks:
+                yield chunk
+            return
+
+        resp_text: Final = self._extract_assistant_text_from_response(assembled)
+        if resp_text is not None:
+            base_messages: Final = self._build_full_history(
+                request_data=request_data, inputs={}, input_type="request"
+            )
+            xg_messages: Final = [*base_messages, {"role": "assistant", "content": resp_text}]
+            scan_result: Final = await self._call_scan(messages=xg_messages, scan_type="response")
+            if scan_result is not None and scan_result.get("decision") == "UNSAFE":
+                yield self._build_block_stream_chunk(scan_result)
+                return
+
+        mock_iter: Final = MockResponseIterator(model_response=assembled)
+        async for chunk in mock_iter:
+            yield chunk
 
     # ------------------------------------------------------------------
     # HTTP helpers
