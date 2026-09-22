@@ -150,3 +150,9 @@ litellm.log
 
 .coverage-rust
 coverage-rust.xml
+litellm_*.log
+
+# local-only dev scratch (corporate TLS-intercepting proxy CA trust, etc.)
+.local/
+Dockerfile.local
+docker-compose.override.yml
