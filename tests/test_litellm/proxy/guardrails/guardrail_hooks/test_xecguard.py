@@ -367,17 +367,40 @@ class TestXecGuardApplyGuardrailSafePath:
         assert result == {"texts": []}
 
     @pytest.mark.asyncio
-    async def test_response_without_assistant_text_returns_inputs(
+    async def test_response_without_llm_response_falls_back_to_inputs_texts(
         self, xecguard_guardrail, mock_request_data
     ):
-        """input_type=response but response has no extractable content."""
+        """input_type=response with no ``request_data['response']`` (e.g. the MCP
+        post_mcp_call seam, where the tool result lives in ``inputs.texts``
+        instead) falls back to scanning ``inputs.texts`` rather than skipping."""
         mock_request_data["response"] = None
-        result = await xecguard_guardrail.apply_guardrail(
-            inputs={"texts": ["text"]},
-            request_data=mock_request_data,
-            input_type="response",
-        )
+        resp = _make_response({"decision": "SAFE", "trace_id": "tr-fallback"})
+        with patch.object(
+            xecguard_guardrail.async_handler, "post", return_value=resp
+        ) as mock_post:
+            result = await xecguard_guardrail.apply_guardrail(
+                inputs={"texts": ["text"]},
+                request_data=mock_request_data,
+                input_type="response",
+            )
         assert result == {"texts": ["text"]}
+        sent = mock_post.call_args.kwargs["json"]
+        assert sent["messages"][-1] == {"role": "assistant", "content": "text"}
+
+    @pytest.mark.asyncio
+    async def test_response_without_response_or_inputs_texts_returns_inputs(
+        self, xecguard_guardrail, mock_request_data
+    ):
+        """Neither an LLM response nor inputs.texts to fall back to → skip."""
+        mock_request_data["response"] = None
+        with patch.object(xecguard_guardrail.async_handler, "post") as mock_post:
+            result = await xecguard_guardrail.apply_guardrail(
+                inputs={"texts": []},
+                request_data=mock_request_data,
+                input_type="response",
+            )
+        assert result == {"texts": []}
+        mock_post.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_synthesized_user_message_from_texts(self, xecguard_guardrail):
