@@ -60,10 +60,14 @@ from litellm.proxy._types import (
     LiteLLM_ManagementEndpoint_MetadataFields_Premium,
 )
 from litellm.types.guardrails import GuardrailEventHooks
+from litellm.types.proxy.guardrails.guardrail_hooks.xecguard import (
+    XECGUARD_DEFAULT_POLICY_OPTIONS,
+)
 from litellm.types.utils import (
     Delta,
     GenericGuardrailAPIInputs,
     GuardrailStatus,
+    GuardrailTracingDetail,
     ModelResponse,
     ModelResponseStream,
     StandardLoggingGuardrailInformation,
@@ -226,6 +230,7 @@ class XecGuardGuardrail(CustomGuardrail):
         api_base: str | None = None,
         xecguard_model: str | None = None,
         policy_names: list[str] | None = None,
+        custom_policy_min_chars: int | None = None,
         apply_to_aliases: Sequence[str] | None = None,
         except_aliases: Sequence[str] | None = None,
         send_meta: bool | None = None,
@@ -253,6 +258,7 @@ class XecGuardGuardrail(CustomGuardrail):
 
         self.xecguard_model = xecguard_model or _DEFAULT_MODEL
         self.policy_names = policy_names
+        self.custom_policy_min_chars = custom_policy_min_chars
         # Guardrail-side key targeting (free, OSS). Normalized to lists.
         self.apply_to_aliases = apply_to_aliases or ()
         self.except_aliases = except_aliases or ()
@@ -484,6 +490,20 @@ class XecGuardGuardrail(CustomGuardrail):
             return inputs
 
         if scan_result.get("decision") == "UNSAFE":
+            self._record_scan_outcome(
+                request_data=request_data,
+                scan_result=scan_result,
+                input_type=input_type,
+                guardrail_status="guardrail_intervened",
+                tracing_detail=GuardrailTracingDetail(
+                    guardrail_action="BLOCKED",
+                    violation_categories=list(self._violated_policy_names(scan_result)),
+                ),
+            )
+            verbose_proxy_logger.info(
+                "XecGuard blocked: %s",
+                json.dumps(self._request_context(request_data, scan_result), ensure_ascii=False, default=str),
+            )
             raise HTTPException(
                 status_code=400,
                 detail={
@@ -510,6 +530,13 @@ class XecGuardGuardrail(CustomGuardrail):
                         },
                     )
 
+        self._record_scan_outcome(
+            request_data=request_data,
+            scan_result=scan_result,
+            input_type=input_type,
+            guardrail_status="success",
+            tracing_detail=GuardrailTracingDetail(guardrail_action="ALLOWED"),
+        )
         return inputs
 
     async def async_logging_hook(
@@ -1000,6 +1027,20 @@ class XecGuardGuardrail(CustomGuardrail):
     # HTTP helpers
     # ------------------------------------------------------------------
 
+    def _resolve_policy_names(self, messages: list[dict]) -> list[str]:
+        if not self.policy_names:
+            return list(_DEFAULT_POLICIES)
+        if self.custom_policy_min_chars is None:
+            return list(self.policy_names)
+        if self._last_user_text_length(messages) > self.custom_policy_min_chars:
+            return list(self.policy_names)
+        defaults: Final = [name for name in self.policy_names if name in XECGUARD_DEFAULT_POLICY_OPTIONS]
+        return defaults or list(_DEFAULT_POLICIES)
+
+    @classmethod
+    def _last_user_text_length(cls, messages: list[dict]) -> int:
+        return len(cls._extract_last_text_by_role(messages, "user") or "")
+
     async def _call_scan(
         self,
         messages: list[dict],
@@ -1011,7 +1052,7 @@ class XecGuardGuardrail(CustomGuardrail):
             "model": self.xecguard_model,
             "scan_type": scan_type,
             "messages": messages,
-            "policy_names": (self.policy_names if self.policy_names else _DEFAULT_POLICIES),
+            "policy_names": self._resolve_policy_names(messages),
         }
         meta: Final = self._build_scan_meta(self._key_context(request_data))
         if meta is not None:
@@ -1305,20 +1346,70 @@ class XecGuardGuardrail(CustomGuardrail):
     # Error-message formatting
     # ------------------------------------------------------------------
 
+    def _record_scan_outcome(
+        self,
+        request_data: dict,
+        scan_result: dict,
+        input_type: Literal["request", "response"],
+        guardrail_status: GuardrailStatus,
+        tracing_detail: GuardrailTracingDetail,
+    ) -> None:
+        self.add_standard_logging_guardrail_information_to_request_data(
+            guardrail_json_response={
+                **_sanitize_scan_result_for_logging(scan_result),
+                "request_context": self._request_context(request_data, scan_result),
+            },
+            request_data=request_data,
+            guardrail_status=guardrail_status,
+            event_type=GuardrailEventHooks.pre_call if input_type == "request" else GuardrailEventHooks.post_call,
+            tracing_detail=tracing_detail,
+        )
+
+    def _request_context(self, request_data: Mapping[str, Any], scan_result: dict) -> dict[str, Any]:
+        fields: Final = {
+            **self._block_log_fields(request_data, scan_result),
+            **dict(self._custom_header_meta_items(request_data)),
+        }
+        return {name: value for name, value in fields.items() if value not in (None, "", ())}
+
+    @classmethod
+    def _block_log_fields(cls, request_data: Mapping[str, Any], scan_result: dict) -> dict[str, Any]:
+        metadata: Final = cls._key_context(request_data) or {}
+        md: Final = next(
+            (m for k in ("metadata", "litellm_metadata") if isinstance(m := metadata.get(k), dict)),
+            {},
+        )
+        violations: Final = scan_result.get("xecguard_result")
+        rationale: Final = next(
+            (v["rationale"] for v in violations if isinstance(v, dict) and v.get("rationale")),
+            None,
+        ) if isinstance(violations, list) else None
+        return {
+            "request_id": request_data.get("litellm_call_id"),
+            "session_id": request_data.get("litellm_session_id") or md.get("session_id"),
+            "user_id": md.get("user_api_key_user_id"),
+            "source_ip": md.get("requester_ip_address"),
+            "user_agent": md.get("user_agent"),
+            "trace_id": scan_result.get("trace_id"),
+            "policies": cls._violated_policy_names(scan_result),
+            "rationale": rationale,
+        }
+
+    @staticmethod
+    def _violated_policy_names(result: dict) -> tuple[str, ...]:
+        violations: Final = result.get("xecguard_result")
+        if not isinstance(violations, list):
+            return ()
+        names: Final = (v.get("violated_policy_name") for v in violations if isinstance(v, dict))
+        return tuple(dict.fromkeys(name for name in names if isinstance(name, str) and name))
+
     @staticmethod
     def _format_scan_block_message(result: dict) -> str:
         trace_id: Final = result.get("trace_id", "")
         violations = result.get("xecguard_result")
         if not isinstance(violations, list):
             violations = []
-        seen: Final[list[str]] = []
-        for v in violations:
-            if not isinstance(v, dict):
-                continue
-            name = v.get("violated_policy_name")
-            if isinstance(name, str) and name and name not in seen:
-                seen.append(name)
-        policies: Final = ",".join(seen) if seen else "unknown"
+        policies: Final = ",".join(XecGuardGuardrail._violated_policy_names(result)) or "unknown"
         rationale = ""
         for v in violations:
             if isinstance(v, dict):

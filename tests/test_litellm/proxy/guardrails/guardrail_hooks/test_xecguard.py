@@ -1007,6 +1007,82 @@ class TestXecGuardGrounding:
 # ---------------------------------------------------------------------------
 
 
+class TestXecGuardCustomPolicyThreshold:
+    DEFAULT = "Default_Policy_HarmfulContentProtection"
+    CUSTOM = "My_Custom_Policy"
+
+    @staticmethod
+    def _guardrail(min_chars, policy_names):
+        return XecGuardGuardrail(
+            api_base="https://api.test.xecguard.local",
+            api_key="xgs_test_abcdef1234567890_secret",
+            guardrail_name="test-xecguard",
+            event_hook="pre_call",
+            default_on=True,
+            policy_names=policy_names,
+            custom_policy_min_chars=min_chars,
+        )
+
+    @staticmethod
+    async def _sent_policies(guardrail, messages):
+        resp = _make_response({"decision": "SAFE"})
+        with patch.object(guardrail.async_handler, "post", return_value=resp) as mock_post:
+            await guardrail.apply_guardrail(
+                inputs={"texts": ["ignored"]},
+                request_data={"messages": messages},
+                input_type="request",
+            )
+        return mock_post.call_args.kwargs["json"]["policy_names"]
+
+    @pytest.mark.asyncio
+    async def test_over_threshold_adds_custom_policy(self):
+        guardrail = self._guardrail(500, [self.DEFAULT, self.CUSTOM])
+        sent = await self._sent_policies(guardrail, [{"role": "user", "content": "a" * 501}])
+        assert sent == [self.DEFAULT, self.CUSTOM]
+
+    @pytest.mark.asyncio
+    async def test_at_threshold_uses_defaults_only(self):
+        guardrail = self._guardrail(500, [self.DEFAULT, self.CUSTOM])
+        sent = await self._sent_policies(guardrail, [{"role": "user", "content": "a" * 500}])
+        assert sent == [self.DEFAULT]
+
+    @pytest.mark.asyncio
+    async def test_only_last_user_message_counts(self):
+        guardrail = self._guardrail(500, [self.DEFAULT, self.CUSTOM])
+        sent = await self._sent_policies(
+            guardrail,
+            [
+                {"role": "user", "content": "a" * 1000},
+                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": "short"},
+            ],
+        )
+        assert sent == [self.DEFAULT]
+
+    @pytest.mark.asyncio
+    async def test_threshold_unset_always_sends_all_policies(self):
+        guardrail = self._guardrail(None, [self.DEFAULT, self.CUSTOM])
+        sent = await self._sent_policies(guardrail, [{"role": "user", "content": "short"}])
+        assert sent == [self.DEFAULT, self.CUSTOM]
+
+    @pytest.mark.asyncio
+    async def test_only_custom_configured_short_input_falls_back_to_builtin_defaults(self):
+        guardrail = self._guardrail(500, [self.CUSTOM])
+        sent = await self._sent_policies(guardrail, [{"role": "user", "content": "short"}])
+        assert sent == [
+            "Default_Policy_SystemPromptEnforcement",
+            "Default_Policy_HarmfulContentProtection",
+            "Default_Policy_GeneralPromptAttackProtection",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_no_policy_names_configured_uses_builtin_defaults(self):
+        guardrail = self._guardrail(500, None)
+        sent = await self._sent_policies(guardrail, [{"role": "user", "content": "a" * 900}])
+        assert self.CUSTOM not in sent
+        assert "Default_Policy_HarmfulContentProtection" in sent
+
+
 class TestXecGuardMessageAssembly:
     @pytest.mark.asyncio
     async def test_full_history_forwarded(self, xecguard_guardrail, mock_request_data):
@@ -2301,6 +2377,7 @@ class TestXecGuardInitializer:
             api_base="https://api.test.xecguard.local",
             xecguard_model="xecguard_v2",
             policy_names=["Default_Policy_SkillsProtection"],
+            custom_policy_min_chars=500,
             apply_to_aliases="key-allow",
             except_aliases="key-deny",
             send_meta=True,
@@ -2316,6 +2393,7 @@ class TestXecGuardInitializer:
 
         assert cb.xecguard_model == "xecguard_v2"
         assert cb.policy_names == ["Default_Policy_SkillsProtection"]
+        assert cb.custom_policy_min_chars == 500
         # the alias lists keep the normalized list the config model produced
         assert cb.apply_to_aliases == ["key-allow"]
         assert cb.except_aliases == ["key-deny"]
@@ -3728,3 +3806,87 @@ class TestXecGuardMcpToolShape:
         assert sent["scan_type"] == "response"
         assert sent["messages"][-1]["role"] == "assistant"
         assert "tool_calls" not in sent["messages"][-1]
+
+
+@pytest.mark.usefixtures("_clean_env")
+class TestXecGuardOtelRequestContext:
+    """The guardrail entry that reaches OTEL (``guardrail_response``) carries the
+    caller context, on allowed and blocked scans alike."""
+
+    def _request_data(self):
+        request_data = _meta_request_data(
+            user_api_key_user_id="u-1",
+            requester_ip_address="10.1.2.3",
+            user_agent="curl/8.0",
+        )
+        request_data["litellm_call_id"] = "call-1"
+        request_data["proxy_server_request"] = {
+            "headers": {"computername": "JOEY-MBP-M4", "useremail": "joey@cycraft.com"}
+        }
+        return request_data
+
+    def _entry(self, request_data):
+        return request_data["metadata"]["standard_logging_guardrail_information"][-1]
+
+    @pytest.mark.asyncio
+    async def test_allowed_scan_records_context_and_allowed_action(self):
+        gr = _extension_guardrail(custom_header_meta_fields=["ComputerName", "UserEmail"])
+        request_data = self._request_data()
+        resp = _make_response({"decision": "SAFE", "trace_id": "tr-1", "xecguard_result": []})
+        with patch.object(gr.async_handler, "post", return_value=resp):
+            await gr.apply_guardrail(
+                inputs={"texts": ["hi"]}, request_data=request_data, input_type="request"
+            )
+        entry = self._entry(request_data)
+        assert entry["guardrail_status"] == "success"
+        assert entry["guardrail_action"] == "ALLOWED"
+        ctx = entry["guardrail_response"]["request_context"]
+        assert ctx == {
+            "request_id": "call-1",
+            "user_id": "u-1",
+            "source_ip": "10.1.2.3",
+            "user_agent": "curl/8.0",
+            "trace_id": "tr-1",
+            "computername": "JOEY-MBP-M4",
+            "useremail": "joey@cycraft.com",
+        }
+
+    @pytest.mark.asyncio
+    async def test_blocked_scan_records_context_policies_and_blocked_action(self):
+        gr = _extension_guardrail(custom_header_meta_fields=["ComputerName"])
+        request_data = self._request_data()
+        resp = _make_response(
+            {
+                "decision": "UNSAFE",
+                "trace_id": "tr-2",
+                "xecguard_result": [
+                    {"violated_policy_name": "PolicyA", "rationale": "because"}
+                ],
+            }
+        )
+        with patch.object(gr.async_handler, "post", return_value=resp):
+            with pytest.raises(HTTPException):
+                await gr.apply_guardrail(
+                    inputs={"texts": ["bad"]}, request_data=request_data, input_type="request"
+                )
+        entry = self._entry(request_data)
+        assert entry["guardrail_status"] == "guardrail_intervened"
+        assert entry["guardrail_action"] == "BLOCKED"
+        assert entry["violation_categories"] == ["PolicyA"]
+        ctx = entry["guardrail_response"]["request_context"]
+        assert ctx["policies"] == ("PolicyA",)
+        assert ctx["rationale"] == "because"
+        assert ctx["computername"] == "JOEY-MBP-M4"
+        assert "useremail" not in ctx
+
+    @pytest.mark.asyncio
+    async def test_absent_values_are_omitted_not_null(self):
+        gr = _extension_guardrail()
+        request_data = _meta_request_data()
+        resp = _make_response({"decision": "SAFE", "trace_id": "tr-3", "xecguard_result": []})
+        with patch.object(gr.async_handler, "post", return_value=resp):
+            await gr.apply_guardrail(
+                inputs={"texts": ["hi"]}, request_data=request_data, input_type="request"
+            )
+        ctx = self._entry(request_data)["guardrail_response"]["request_context"]
+        assert ctx == {"trace_id": "tr-3"}
