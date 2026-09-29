@@ -3513,6 +3513,122 @@ class TestXecGuardScanMetaVirtualkeyObject:
         assert payload["meta"]["data"]["key_id"] == "abc123"
 
 
+@pytest.mark.usefixtures("_clean_env")
+class TestXecGuardScanMetaCustomHeaders:
+    """``custom_header_meta_fields`` (a config list, like litellm's own
+    ``extra_spend_tag_headers``) forwards named caller-supplied request headers
+    into meta.data. Headers arrive already lower-cased (the proxy lower-cases
+    header names before storing them in proxy_server_request.headers); the
+    meta.data field name is derived from the configured header name rather than
+    a separate mapping, so adding a new header is a one-line config change."""
+
+    def _request_data_with_headers(self, headers, alias="team-alpha"):
+        request_data = _meta_request_data(alias=alias)
+        request_data["proxy_server_request"] = {"headers": headers}
+        return request_data
+
+    @pytest.mark.asyncio
+    async def test_configured_headers_forwarded_with_derived_field_names(self):
+        # The field name is the configured header name lower-cased verbatim, no
+        # word-splitting: "ComputerName" -> "computername", not "computer_name".
+        gr = _extension_guardrail(
+            send_meta=True, custom_header_meta_fields=["ComputerName", "UserEmail"]
+        )
+        payload = await _sent_payload(
+            gr,
+            self._request_data_with_headers(
+                {"computername": "JOEY-MBP-M4", "useremail": "joey.zeng@cycraft.com"}
+            ),
+        )
+        data = payload["meta"]["data"]
+        assert data["computername"] == "JOEY-MBP-M4"
+        assert data["useremail"] == "joey.zeng@cycraft.com"
+
+    @pytest.mark.asyncio
+    async def test_adding_a_new_header_needs_no_mapping_change(self):
+        """The regression this config shape exists to prevent: a header added
+        later (e.g. SerialNumber) must work from config alone, with no separate
+        header-name -> field-name table to also update."""
+        gr = _extension_guardrail(
+            send_meta=True, custom_header_meta_fields=["SerialNumber"]
+        )
+        payload = await _sent_payload(
+            gr, self._request_data_with_headers({"serialnumber": "SN-42"})
+        )
+        assert payload["meta"]["data"]["serialnumber"] == "SN-42"
+
+    @pytest.mark.asyncio
+    async def test_unconfigured_is_opt_in_forwards_nothing(self):
+        """No custom_header_meta_fields configured -> no custom headers are
+        read at all, even if proxy_server_request carries them."""
+        gr = _extension_guardrail(send_meta=True)
+        payload = await _sent_payload(
+            gr,
+            self._request_data_with_headers(
+                {"computername": "JOEY-MBP-M4", "useremail": "joey.zeng@cycraft.com"}
+            ),
+        )
+        data = _admin_data(payload["meta"])
+        assert "computername" not in data
+        assert "user_email" not in data
+
+    @pytest.mark.asyncio
+    async def test_missing_custom_headers_omit_those_fields(self):
+        gr = _extension_guardrail(
+            send_meta=True, custom_header_meta_fields=["ComputerName", "UserEmail"]
+        )
+        payload = await _sent_payload(gr, self._request_data_with_headers({}))
+        data = _admin_data(payload["meta"])
+        assert "computername" not in data
+        assert "user_email" not in data
+
+    @pytest.mark.asyncio
+    async def test_no_proxy_server_request_key_does_not_raise(self):
+        """pre/during_call request_data lacks proxy_server_request in some SDK call
+        paths; the lookup must degrade to "no custom header fields", not crash."""
+        gr = _extension_guardrail(
+            send_meta=True, custom_header_meta_fields=["ComputerName", "UserEmail"]
+        )
+        payload = await _sent_payload(gr, _meta_request_data(alias="team-alpha"))
+        data = _admin_data(payload["meta"])
+        assert "computername" not in data
+        assert "user_email" not in data
+
+    @pytest.mark.asyncio
+    async def test_auto_field_wins_over_custom_header_on_name_collision(self):
+        """"user_email" is the auto field's name (from user_api_key_user_email).
+        A custom header configured to derive that exact field name (a header
+        literally named "user_email", not "UserEmail" -> "useremail") must not
+        be able to override the proxy's own record of the calling key's email
+        -- auto fields are merged first and win collisions (see
+        _build_scan_meta_data docstring)."""
+        gr = _extension_guardrail(
+            send_meta=True, custom_header_meta_fields=["user_email"]
+        )
+        request_data = self._request_data_with_headers(
+            {"user_email": "spoofed@example.com"}, alias="team-alpha"
+        )
+        request_data["metadata"]["user_api_key_user_email"] = "real@cycraft.com"
+        payload = await _sent_payload(gr, request_data)
+        assert payload["meta"]["data"]["user_email"] == "real@cycraft.com"
+
+    @pytest.mark.asyncio
+    async def test_custom_header_wins_over_admin_key_metadata_on_name_collision(self):
+        """Ordering in _build_scan_meta_data is proxy-injected, then custom
+        headers, then the admin's own key metadata -- so an admin can't shadow
+        a caller-supplied header field by naming their own key metadata field
+        the same thing."""
+        gr = _extension_guardrail(
+            send_meta=True, custom_header_meta_fields=["ComputerName"]
+        )
+        request_data = self._request_data_with_headers(
+            {"computername": "JOEY-MBP-M4"}, alias="team-alpha"
+        )
+        request_data["metadata"]["user_api_key_metadata"] = {"computername": "spoofed"}
+        payload = await _sent_payload(gr, request_data)
+        assert payload["meta"]["data"]["computername"] == "JOEY-MBP-M4"
+
+
 # ---------------------------------------------------------------------------
 # MCP seam — the tool traffic is rebuilt as the OpenAI wire shape, because that
 # is what makes XecGuard route the turn to ToolUse_Guard. Shapes and scan_type

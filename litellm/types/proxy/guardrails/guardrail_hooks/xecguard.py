@@ -92,6 +92,17 @@ class XecGuardConfigModel(GuardrailConfigModel):
             "comma-separated string. Only used when `send_meta` is enabled."
         ),
     )
+    custom_header_meta_fields: str | list[str] | None = Field(  # mutable-ok: list sets UI type; Sequence ambiguous
+        default=None,
+        description=(
+            "Request headers to forward into `meta.data`, named as the caller "
+            "sends them (e.g. `ComputerName`, `UserEmail`). The `meta.data` "
+            "field name is derived automatically from the header name "
+            "(lower-cased); add a new header here without redeploying - no "
+            "separate field-name mapping to maintain. Accepts a list or a "
+            "comma-separated string. Only used when `send_meta` is enabled."
+        ),
+    )
     # Named `meta_identity_format`, not `meta_virtualkey_format`: the proxy masks
     # any litellm_param whose name contains "key" before serving it back, so a
     # `virtualkey` in the name means the UI form prefills "ob****ct" and saving
@@ -159,7 +170,9 @@ class XecGuardConfigModel(GuardrailConfigModel):
         ),
     )
 
-    @field_validator("apply_to_aliases", "except_aliases", "meta_data_fields", mode="before")
+    @field_validator(
+        "apply_to_aliases", "except_aliases", "meta_data_fields", "custom_header_meta_fields", mode="before"
+    )
     @classmethod
     def _normalize_alias_list(cls, v: object) -> object:
         """Accept either a list or a comma-separated string (the UI submits a

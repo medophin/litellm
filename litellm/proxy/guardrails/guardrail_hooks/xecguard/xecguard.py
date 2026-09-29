@@ -147,6 +147,10 @@ _DEFAULT_POLICIES: Final = [
 # every value is coerced or dropped here rather than risking a scan failure.
 _METADATA_KEY_METADATA_FIELD: Final = "user_api_key_metadata"
 _META_NAME_PATTERN: Final = re.compile(r"^[A-Za-z_][A-Za-z0-9_.\-]{0,63}$")
+# Chars a custom-header-derived meta.data field name must not carry (spaces,
+# colons, etc. - whatever _META_NAME_PATTERN's body class excludes with the
+# leading-char rule stripped out, since that's handled separately below).
+_META_INVALID_NAME_CHARS: Final = re.compile(r"[^A-Za-z0-9_.\-]+")
 _META_CONTROL_CHARS: Final = re.compile(r"[\x00-\x1f\x7f]")
 _META_MAX_DATA_FIELDS: Final = 32
 _META_MAX_VALUE_CHARS: Final = 512
@@ -226,6 +230,7 @@ class XecGuardGuardrail(CustomGuardrail):
         except_aliases: Sequence[str] | None = None,
         send_meta: bool | None = None,
         meta_data_fields: Sequence[str] | None = None,
+        custom_header_meta_fields: Sequence[str] | None = None,
         meta_identity_format: str | None = None,
         block_on_error: bool | None = None,
         grounding_strictness: str | None = None,
@@ -264,6 +269,12 @@ class XecGuardGuardrail(CustomGuardrail):
         else:
             self.send_meta = send_meta
         self.meta_data_fields = tuple(meta_data_fields) if meta_data_fields else ()
+        # Request headers to forward into meta.data, named as the caller sends
+        # them (e.g. "ComputerName"). Matched against proxy_server_request.headers
+        # case-insensitively (the proxy lower-cases header names before storing
+        # them); the meta.data field name is derived from the configured header
+        # name - see _custom_header_meta_items.
+        self.custom_header_meta_fields = tuple(custom_header_meta_fields) if custom_header_meta_fields else ()
 
         # Wire shape of ``meta.virtualkey``. Defaults to the string form: a backend
         # that only accepts strings answers the object form with 400, and with
@@ -871,16 +882,50 @@ class XecGuardGuardrail(CustomGuardrail):
                         injected[name] = md[source_field]
         return tuple((name, injected[name]) for name, _ in _META_AUTO_DATA_FIELDS if name in injected)
 
+    def _custom_header_meta_items(self, context: Mapping[str, Any] | None) -> tuple[tuple[str, Any], ...]:
+        """Caller-supplied request headers named in ``self.custom_header_meta_fields``,
+        read from ``proxy_server_request.headers``.
+
+        The proxy lower-cases header names before storing them (see
+        ``clean_headers`` in ``litellm_pre_call_utils.py``), so lookup here
+        lower-cases the configured header name to match. The meta.data field
+        name is derived from the configured header name (lower-cased, every
+        run of characters ``_META_NAME_PATTERN`` rejects collapsed to a single
+        underscore) rather than configured separately, so adding a new header
+        is a one-line config change - no separate field-name mapping to keep
+        in sync.
+        """
+        if not self.custom_header_meta_fields:
+            return ()
+        if not isinstance(context, dict):
+            return ()
+        proxy_server_request: Final = context.get("proxy_server_request")
+        if not isinstance(proxy_server_request, dict):
+            return ()
+        headers: Final = proxy_server_request.get("headers")
+        if not isinstance(headers, dict):
+            return ()
+        items: Final[list[tuple[str, Any]]] = []  # mutable-ok: built once per call, returned as a tuple
+        for header_name in self.custom_header_meta_fields:
+            value = headers.get(header_name.lower())
+            if value is None:
+                continue
+            field_name = _META_INVALID_NAME_CHARS.sub("_", header_name.lower()).strip("_")
+            if field_name:
+                items.append((field_name, value))
+        return tuple(items)
+
     def _build_scan_meta_data(
         self, context: Mapping[str, Any] | None, virtualkey: str | Mapping[str, str]
     ) -> Mapping[str, str]:
         """Coerce the calling key's attributes and metadata into ``meta.data``.
 
-        Two sources, in this order: the attributes the proxy injects about the
-        calling key (identity, tenancy, budget), then the free-form metadata an
-        admin typed into the key's Metadata box. Proxy-injected attributes go
-        first and win a name collision, so an admin cannot shadow ``key_id`` with
-        a field of their own and mislead an investigation.
+        Three sources, in this order: the attributes the proxy injects about the
+        calling key (identity, tenancy, budget), then caller-supplied request
+        headers named in ``_META_CUSTOM_HEADER_FIELDS``, then the free-form
+        metadata an admin typed into the key's Metadata box. Earlier sources win
+        a name collision, so a request header cannot shadow ``key_id`` and an
+        admin's own metadata cannot shadow either of the first two.
 
         Fields are kept while they satisfy the contract: a name matching the
         backend's pattern, a flat scalar value, at most 32 fields, and a
@@ -896,7 +941,11 @@ class XecGuardGuardrail(CustomGuardrail):
         probe: Final[dict[str, Any]] = {"virtualkey": virtualkey, "data": data}  # mutable-ok: views `data`
         dropped: Final[list[str]] = []  # mutable-ok: skipped field names, for one debug line
 
-        for name, raw_value in (*self._auto_meta_data_items(context), *source.items()):
+        for name, raw_value in (
+            *self._auto_meta_data_items(context),
+            *self._custom_header_meta_items(context),
+            *source.items(),
+        ):
             if self.meta_data_fields:
                 if name not in self.meta_data_fields:
                     continue

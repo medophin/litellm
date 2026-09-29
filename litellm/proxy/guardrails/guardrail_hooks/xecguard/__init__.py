@@ -23,6 +23,7 @@ def initialize_guardrail(
         except_aliases=litellm_params.except_aliases,
         send_meta=litellm_params.send_meta,
         meta_data_fields=litellm_params.meta_data_fields,
+        custom_header_meta_fields=litellm_params.custom_header_meta_fields,
         meta_identity_format=litellm_params.meta_identity_format,
         block_on_error=litellm_params.block_on_error,
         grounding_strictness=litellm_params.grounding_strictness,
