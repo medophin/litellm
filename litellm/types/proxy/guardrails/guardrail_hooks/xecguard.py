@@ -48,6 +48,14 @@ class XecGuardConfigModel(GuardrailConfigModel):
             "options": list(XECGUARD_DEFAULT_POLICY_OPTIONS),
         },
     )
+    custom_policy_min_chars: int | None = Field(
+        default=None,
+        description=(
+            "Custom policies (any name in `policy_names` that is not a built-in "
+            "default) are only sent when the last user message is longer than "
+            "this many characters. Leave empty to always send every policy."
+        ),
+    )
     apply_to_aliases: str | list[str] | None = Field(  # mutable-ok: list sets UI type; Sequence ambiguous
         default=None,
         description=(

@@ -19,6 +19,7 @@ def initialize_guardrail(
         api_key=litellm_params.api_key,
         xecguard_model=litellm_params.xecguard_model,
         policy_names=litellm_params.policy_names,
+        custom_policy_min_chars=litellm_params.custom_policy_min_chars,
         apply_to_aliases=litellm_params.apply_to_aliases,
         except_aliases=litellm_params.except_aliases,
         send_meta=litellm_params.send_meta,
