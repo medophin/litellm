@@ -60,9 +60,6 @@ from litellm.proxy._types import (
     LiteLLM_ManagementEndpoint_MetadataFields_Premium,
 )
 from litellm.types.guardrails import GuardrailEventHooks
-from litellm.types.proxy.guardrails.guardrail_hooks.xecguard import (
-    XECGUARD_DEFAULT_POLICY_OPTIONS,
-)
 from litellm.types.utils import (
     Delta,
     GenericGuardrailAPIInputs,
@@ -230,6 +227,7 @@ class XecGuardGuardrail(CustomGuardrail):
         api_base: str | None = None,
         xecguard_model: str | None = None,
         policy_names: list[str] | None = None,
+        custom_policy_names: Sequence[str] | None = None,
         custom_policy_min_chars: int | None = None,
         apply_to_aliases: Sequence[str] | None = None,
         except_aliases: Sequence[str] | None = None,
@@ -258,6 +256,7 @@ class XecGuardGuardrail(CustomGuardrail):
 
         self.xecguard_model = xecguard_model or _DEFAULT_MODEL
         self.policy_names = policy_names
+        self.custom_policy_names = tuple(custom_policy_names) if custom_policy_names else ()
         self.custom_policy_min_chars = custom_policy_min_chars
         # Guardrail-side key targeting (free, OSS). Normalized to lists.
         self.apply_to_aliases = apply_to_aliases or ()
@@ -1028,14 +1027,12 @@ class XecGuardGuardrail(CustomGuardrail):
     # ------------------------------------------------------------------
 
     def _resolve_policy_names(self, messages: list[dict]) -> list[str]:
-        if not self.policy_names:
-            return list(_DEFAULT_POLICIES)
-        if self.custom_policy_min_chars is None:
-            return list(self.policy_names)
-        if self._last_user_text_length(messages) > self.custom_policy_min_chars:
-            return list(self.policy_names)
-        defaults: Final = [name for name in self.policy_names if name in XECGUARD_DEFAULT_POLICY_OPTIONS]
-        return defaults or list(_DEFAULT_POLICIES)
+        base: Final = list(self.policy_names or ())
+        custom_applies: Final = self.custom_policy_min_chars is None or (
+            self._last_user_text_length(messages) > self.custom_policy_min_chars
+        )
+        selected: Final = [*base, *(self.custom_policy_names if custom_applies else ())]
+        return list(dict.fromkeys(selected)) or list(_DEFAULT_POLICIES)
 
     @classmethod
     def _last_user_text_length(cls, messages: list[dict]) -> int:

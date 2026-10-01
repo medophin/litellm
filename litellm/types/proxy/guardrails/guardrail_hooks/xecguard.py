@@ -48,12 +48,21 @@ class XecGuardConfigModel(GuardrailConfigModel):
             "options": list(XECGUARD_DEFAULT_POLICY_OPTIONS),
         },
     )
+    custom_policy_names: str | list[str] | None = Field(  # mutable-ok: list sets UI type; Sequence ambiguous
+        default=None,
+        description=(
+            "Additional policy names that are not in the list above, such as "
+            "policies created in XecGuard. They are sent together with the "
+            "selected policies on each scan. Accepts a list or a "
+            "comma-separated string."
+        ),
+    )
     custom_policy_min_chars: int | None = Field(
         default=None,
         description=(
-            "Custom policies (any name in `policy_names` that is not a built-in "
-            "default) are only sent when the last user message is longer than "
-            "this many characters. Leave empty to always send every policy."
+            "Policies in `custom_policy_names` are only sent when the last user "
+            "message is longer than this many characters. Leave empty to always "
+            "send them."
         ),
     )
     apply_to_aliases: str | list[str] | None = Field(  # mutable-ok: list sets UI type; Sequence ambiguous
@@ -179,7 +188,12 @@ class XecGuardConfigModel(GuardrailConfigModel):
     )
 
     @field_validator(
-        "apply_to_aliases", "except_aliases", "meta_data_fields", "custom_header_meta_fields", mode="before"
+        "apply_to_aliases",
+        "except_aliases",
+        "meta_data_fields",
+        "custom_header_meta_fields",
+        "custom_policy_names",
+        mode="before",
     )
     @classmethod
     def _normalize_alias_list(cls, v: object) -> object:

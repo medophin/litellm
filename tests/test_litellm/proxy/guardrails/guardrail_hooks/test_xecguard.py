@@ -1010,9 +1010,14 @@ class TestXecGuardGrounding:
 class TestXecGuardCustomPolicyThreshold:
     DEFAULT = "Default_Policy_HarmfulContentProtection"
     CUSTOM = "My_Custom_Policy"
+    BUILTIN_FALLBACK = [
+        "Default_Policy_SystemPromptEnforcement",
+        "Default_Policy_HarmfulContentProtection",
+        "Default_Policy_GeneralPromptAttackProtection",
+    ]
 
     @staticmethod
-    def _guardrail(min_chars, policy_names):
+    def _guardrail(min_chars, policy_names, custom_policy_names=("My_Custom_Policy",)):
         return XecGuardGuardrail(
             api_base="https://api.test.xecguard.local",
             api_key="xgs_test_abcdef1234567890_secret",
@@ -1020,6 +1025,7 @@ class TestXecGuardCustomPolicyThreshold:
             event_hook="pre_call",
             default_on=True,
             policy_names=policy_names,
+            custom_policy_names=custom_policy_names,
             custom_policy_min_chars=min_chars,
         )
 
@@ -1035,20 +1041,26 @@ class TestXecGuardCustomPolicyThreshold:
         return mock_post.call_args.kwargs["json"]["policy_names"]
 
     @pytest.mark.asyncio
+    async def test_custom_policies_are_sent_together_with_selected_ones(self):
+        guardrail = self._guardrail(None, [self.DEFAULT])
+        sent = await self._sent_policies(guardrail, [{"role": "user", "content": "short"}])
+        assert sent == [self.DEFAULT, self.CUSTOM]
+
+    @pytest.mark.asyncio
     async def test_over_threshold_adds_custom_policy(self):
-        guardrail = self._guardrail(500, [self.DEFAULT, self.CUSTOM])
+        guardrail = self._guardrail(500, [self.DEFAULT])
         sent = await self._sent_policies(guardrail, [{"role": "user", "content": "a" * 501}])
         assert sent == [self.DEFAULT, self.CUSTOM]
 
     @pytest.mark.asyncio
-    async def test_at_threshold_uses_defaults_only(self):
-        guardrail = self._guardrail(500, [self.DEFAULT, self.CUSTOM])
+    async def test_at_threshold_uses_selected_only(self):
+        guardrail = self._guardrail(500, [self.DEFAULT])
         sent = await self._sent_policies(guardrail, [{"role": "user", "content": "a" * 500}])
         assert sent == [self.DEFAULT]
 
     @pytest.mark.asyncio
     async def test_only_last_user_message_counts(self):
-        guardrail = self._guardrail(500, [self.DEFAULT, self.CUSTOM])
+        guardrail = self._guardrail(500, [self.DEFAULT])
         sent = await self._sent_policies(
             guardrail,
             [
@@ -1060,27 +1072,34 @@ class TestXecGuardCustomPolicyThreshold:
         assert sent == [self.DEFAULT]
 
     @pytest.mark.asyncio
-    async def test_threshold_unset_always_sends_all_policies(self):
+    async def test_only_custom_configured_short_input_falls_back_to_builtin_defaults(self):
+        guardrail = self._guardrail(500, None)
+        sent = await self._sent_policies(guardrail, [{"role": "user", "content": "short"}])
+        assert sent == self.BUILTIN_FALLBACK
+
+    @pytest.mark.asyncio
+    async def test_only_custom_configured_long_input_sends_just_the_custom_policy(self):
+        guardrail = self._guardrail(500, None)
+        sent = await self._sent_policies(guardrail, [{"role": "user", "content": "a" * 900}])
+        assert sent == [self.CUSTOM]
+
+    @pytest.mark.asyncio
+    async def test_duplicate_between_selected_and_custom_is_sent_once(self):
         guardrail = self._guardrail(None, [self.DEFAULT, self.CUSTOM])
         sent = await self._sent_policies(guardrail, [{"role": "user", "content": "short"}])
         assert sent == [self.DEFAULT, self.CUSTOM]
 
     @pytest.mark.asyncio
-    async def test_only_custom_configured_short_input_falls_back_to_builtin_defaults(self):
-        guardrail = self._guardrail(500, [self.CUSTOM])
-        sent = await self._sent_policies(guardrail, [{"role": "user", "content": "short"}])
-        assert sent == [
-            "Default_Policy_SystemPromptEnforcement",
-            "Default_Policy_HarmfulContentProtection",
-            "Default_Policy_GeneralPromptAttackProtection",
-        ]
-
-    @pytest.mark.asyncio
-    async def test_no_policy_names_configured_uses_builtin_defaults(self):
-        guardrail = self._guardrail(500, None)
+    async def test_no_policies_configured_uses_builtin_defaults(self):
+        guardrail = self._guardrail(500, None, custom_policy_names=None)
         sent = await self._sent_policies(guardrail, [{"role": "user", "content": "a" * 900}])
-        assert self.CUSTOM not in sent
-        assert "Default_Policy_HarmfulContentProtection" in sent
+        assert sent == self.BUILTIN_FALLBACK
+
+    def test_config_model_accepts_comma_separated_custom_policy_names(self):
+        from litellm.types.proxy.guardrails.guardrail_hooks.xecguard import XecGuardConfigModel
+
+        model = XecGuardConfigModel(custom_policy_names="  Fruit_Detection , Other_Policy ,")
+        assert model.custom_policy_names == ["Fruit_Detection", "Other_Policy"]
 
 
 class TestXecGuardMessageAssembly:
