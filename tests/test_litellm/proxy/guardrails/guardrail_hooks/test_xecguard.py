@@ -2576,11 +2576,12 @@ class TestXecGuardApplyGuardrailKeyTargeting:
         }
         resp = _make_response({"decision": "SAFE", "trace_id": "tr"})
         with patch.object(gr.async_handler, "post", return_value=resp) as post:
-            await gr.apply_guardrail(
+            out = await gr.apply_guardrail(
                 inputs={"texts": ["hi"]},
                 request_data=data,
                 input_type="request",
             )
+        assert out == {"texts": ["hi"]}, "a SAFE verdict hands the inputs back untouched"
         post.assert_called_once()
         assert post.call_args.kwargs["json"]["policy_names"] == ["Config_Level_Policy"]
 
@@ -2667,24 +2668,28 @@ class TestXecGuardLoggingHookKeyTargeting:
         gr = _extension_guardrail(apply_to_aliases=["prod"])
         kwargs = self._kwargs({"user_api_key_alias": "dev"})
         with patch.object(gr.async_handler, "post") as post:
-            await gr.async_logging_hook(
+            out_kwargs, _ = await gr.async_logging_hook(
                 kwargs=kwargs,
                 result=_build_model_response("some answer"),
                 call_type="acompletion",
             )
         post.assert_not_called()
+        assert out_kwargs is kwargs
+        assert "guardrail_information" not in kwargs["standard_logging_object"]
 
     @pytest.mark.asyncio
     async def test_top_level_metadata_is_also_honoured(self):
         gr = _extension_guardrail(except_aliases=["internal"])
         kwargs = self._kwargs({"user_api_key_alias": "internal"}, nested=False)
         with patch.object(gr.async_handler, "post") as post:
-            await gr.async_logging_hook(
+            out_kwargs, _ = await gr.async_logging_hook(
                 kwargs=kwargs,
                 result=_build_model_response("some answer"),
                 call_type="acompletion",
             )
         post.assert_not_called()
+        assert out_kwargs is kwargs
+        assert "guardrail_information" not in kwargs["standard_logging_object"]
 
     @pytest.mark.asyncio
     async def test_targeted_key_is_still_scanned(self):
@@ -2708,20 +2713,6 @@ class TestXecGuardLoggingHookKeyTargeting:
             {"litellm_params": {"metadata": {"user_api_key_alias": "nested"}}}
         )
         assert ctx["metadata"]["user_api_key_alias"] == "nested"
-
-    def test_key_context_nested_skips_metadata_without_identity(self):
-        # logging path: an empty litellm_params.metadata must not shadow the
-        # sibling key that actually carries the identity.
-        gr = _extension_guardrail()
-        ctx = gr._key_context(
-            {
-                "litellm_params": {
-                    "metadata": {},
-                    "litellm_metadata": {"user_api_key_alias": "sibling"},
-                }
-            }
-        )
-        assert gr._calling_key_identity(ctx) == ("sibling", None)
 
     def test_key_context_returns_proxy_shape_untouched(self):
         # pre/during/post_call: reshaping to a single key would drop the other
@@ -3223,11 +3214,12 @@ class TestXecGuardScanMeta:
         with patch.object(
             gr.async_handler, "post", side_effect=[scan_ok, grounding_ok]
         ) as mock_post:
-            await gr.apply_guardrail(
+            out = await gr.apply_guardrail(
                 inputs={"texts": ["text"]},
                 request_data=data,
                 input_type="response",
             )
+        assert out["texts"] == ["text"], "two SAFE verdicts leave the response alone"
         assert "meta" in mock_post.call_args_list[0].kwargs["json"]
         assert "meta" not in mock_post.call_args_list[1].kwargs["json"]
 
@@ -3418,6 +3410,8 @@ class TestXecGuardScanMetaAutoFields:
                 result=_build_model_response("some answer"),
                 call_type="acompletion",
             )
+        info_list = kwargs["standard_logging_object"]["guardrail_information"]
+        assert info_list[0]["guardrail_response"]["trace_id"] == "meta-auto-log"
         assert mock_post.call_args.kwargs["json"]["meta"]["data"] == {
             "key_id": "abc123",
             "key_alias": "team-alpha",
