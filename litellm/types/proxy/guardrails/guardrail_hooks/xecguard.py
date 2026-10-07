@@ -61,8 +61,8 @@ class XecGuardConfigModel(GuardrailConfigModel):
         default=None,
         description=(
             "Policies in `custom_policy_names` are only sent when the last user "
-            "message is longer than this many characters. Leave empty to always "
-            "send them."
+            "message is longer than this many characters. Defaults to 500. "
+            "Set 0 to always send them."
         ),
     )
     apply_to_aliases: str | None = Field(

@@ -1042,9 +1042,36 @@ class TestXecGuardCustomPolicyThreshold:
 
     @pytest.mark.asyncio
     async def test_custom_policies_are_sent_together_with_selected_ones(self):
-        guardrail = self._guardrail(None, [self.DEFAULT])
+        guardrail = self._guardrail(0, [self.DEFAULT])
         sent = await self._sent_policies(guardrail, [{"role": "user", "content": "short"}])
         assert sent == [self.DEFAULT, self.CUSTOM]
+
+    def test_threshold_defaults_to_500_when_not_configured(self):
+        assert self._guardrail(None, [self.DEFAULT]).custom_policy_min_chars == 500
+
+    @pytest.mark.asyncio
+    async def test_unset_threshold_holds_back_custom_policies_on_short_input(self):
+        guardrail = self._guardrail(None, [self.DEFAULT])
+        sent = await self._sent_policies(guardrail, [{"role": "user", "content": "a" * 500}])
+        assert sent == [self.DEFAULT]
+
+    @pytest.mark.asyncio
+    async def test_unset_threshold_sends_custom_policies_above_500(self):
+        guardrail = self._guardrail(None, [self.DEFAULT])
+        sent = await self._sent_policies(guardrail, [{"role": "user", "content": "a" * 501}])
+        assert sent == [self.DEFAULT, self.CUSTOM]
+
+    @pytest.mark.asyncio
+    async def test_zero_means_no_threshold(self):
+        guardrail = self._guardrail(0, [self.DEFAULT])
+        sent = await self._sent_policies(guardrail, [{"role": "user", "content": "x"}])
+        assert sent == [self.DEFAULT, self.CUSTOM]
+
+    def test_negative_threshold_is_treated_as_zero(self):
+        assert self._guardrail(-5, [self.DEFAULT]).custom_policy_min_chars == 0
+
+    def test_an_explicit_value_beats_the_default(self):
+        assert self._guardrail(200, [self.DEFAULT]).custom_policy_min_chars == 200
 
     @pytest.mark.asyncio
     async def test_over_threshold_adds_custom_policy(self):
@@ -3965,3 +3992,27 @@ class TestXecGuardListFieldsRoundTripThroughTheUi:
     def test_empty_and_none_mean_no_items(self, name):
         assert tuple(getattr(_extension_guardrail(**{name: ""}), name)) == ()
         assert tuple(getattr(_extension_guardrail(**{name: None}), name)) == ()
+
+
+class TestXecGuardCustomPolicyThresholdFromConfig:
+    def _build(self, **extra):
+        from litellm.proxy.guardrails.guardrail_hooks.xecguard import initialize_guardrail
+        from litellm.types.guardrails import LitellmParams
+
+        params = LitellmParams(guardrail="xecguard", mode="pre_call", api_key="xgs_t", api_base="https://x.local", **extra)
+        return initialize_guardrail(litellm_params=params, guardrail={"guardrail_name": "g"})
+
+    def test_a_guardrail_created_without_the_field_gets_500(self):
+        assert self._build().custom_policy_min_chars == 500
+
+    def test_a_guardrail_created_with_zero_keeps_zero(self):
+        assert self._build(custom_policy_min_chars=0).custom_policy_min_chars == 0
+
+    def test_a_guardrail_created_with_a_value_keeps_it(self):
+        assert self._build(custom_policy_min_chars=120).custom_policy_min_chars == 120
+
+    def test_the_field_description_states_the_default(self):
+        from litellm.types.proxy.guardrails.guardrail_hooks.xecguard import XecGuardConfigModel
+
+        description = XecGuardConfigModel.model_fields["custom_policy_min_chars"].description
+        assert "500" in description and "0" in description

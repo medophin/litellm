@@ -141,6 +141,7 @@ _DEFAULT_API_BASE: Final = "https://api-xecguard.cycraft.ai"
 _SCAN_ENDPOINT: Final = "/xecguard/v1/scan"
 _GROUNDING_ENDPOINT: Final = "/xecguard/v1/grounding"
 _DEFAULT_MODEL: Final = "xecguard_v2"
+_DEFAULT_CUSTOM_POLICY_MIN_CHARS: Final = 500
 _DEFAULT_GROUNDING_STRICTNESS: Final = "BALANCED"
 _METADATA_GROUNDING_KEY: Final = "xecguard_grounding_documents"
 _RATIONALE_TRUNCATE_CHARS: Final = 200
@@ -266,7 +267,9 @@ class XecGuardGuardrail(CustomGuardrail):
         self.xecguard_model = xecguard_model or _DEFAULT_MODEL
         self.policy_names = policy_names
         self.custom_policy_names = _split_list_param(custom_policy_names)
-        self.custom_policy_min_chars = custom_policy_min_chars
+        self.custom_policy_min_chars = (
+            _DEFAULT_CUSTOM_POLICY_MIN_CHARS if custom_policy_min_chars is None else max(0, custom_policy_min_chars)
+        )
         # Guardrail-side key targeting (free, OSS). Normalized to lists.
         self.apply_to_aliases = _split_list_param(apply_to_aliases)
         self.except_aliases = _split_list_param(except_aliases)
@@ -1037,9 +1040,7 @@ class XecGuardGuardrail(CustomGuardrail):
 
     def _resolve_policy_names(self, messages: list[dict]) -> list[str]:
         base: Final = list(self.policy_names or ())
-        custom_applies: Final = self.custom_policy_min_chars is None or (
-            self._last_user_text_length(messages) > self.custom_policy_min_chars
-        )
+        custom_applies: Final = self._last_user_text_length(messages) > self.custom_policy_min_chars
         selected: Final = [*base, *(self.custom_policy_names if custom_applies else ())]
         return list(dict.fromkeys(selected)) or list(_DEFAULT_POLICIES)
 
