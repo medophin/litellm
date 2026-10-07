@@ -1191,7 +1191,42 @@ class XecGuardGuardrail(CustomGuardrail):
         if input_type == "request" and isinstance(structured, list) and structured:
             self._warn_once_if_system_prompt_is_stripped()
             return structured
+        if input_type == "response":
+            return self._request_turns_from_body(request_data)
         return request_data.get("messages") or []
+
+    @staticmethod
+    def _request_turns_from_body(request_data: dict) -> list[Any]:
+        """The request half of a response scan, rebuilt from the client's own body.
+
+        litellm gives no ``structured_messages`` after the model has answered, but the
+        body is still there, and XecGuard refuses a scan that has no user turn. A chat
+        body already carries ``messages``; Anthropic keeps ``system`` beside them and
+        Responses uses ``input`` + ``instructions``.
+        """
+        messages: Final = request_data.get("messages")
+        if isinstance(messages, list) and messages:
+            system: Final = request_data.get("system")
+            has_system_turn: Final = any(isinstance(m, dict) and m.get("role") == "system" for m in messages)
+            if system and not has_system_turn:
+                return [{"role": "system", "content": system}, *messages]
+            return messages
+        if request_data.get("input") is None:
+            return []
+        try:
+            from litellm.responses.litellm_completion_transformation.transformation import (
+                LiteLLMCompletionResponsesConfig,
+            )
+
+            return list(
+                LiteLLMCompletionResponsesConfig.transform_responses_api_input_to_messages(
+                    input=request_data["input"],
+                    responses_api_request=request_data,
+                )
+            )
+        except Exception as exc:
+            verbose_proxy_logger.debug("XecGuard: could not rebuild the request from a Responses body: %s", exc)
+            return []
 
     def _warn_once_if_system_prompt_is_stripped(self) -> None:
         if self._warned_system_stripped or not effective_skip_system_message_for_guardrail(self):

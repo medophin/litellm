@@ -4157,3 +4157,105 @@ class TestXecGuardSkipSystemWarning:
         with patch("litellm.proxy.guardrails.guardrail_hooks.xecguard.xecguard.verbose_proxy_logger") as logger:
             await _sent_messages(gr, {"messages": FULL_CONVERSATION}, {"texts": ["x"], "structured_messages": FULL_CONVERSATION})
         assert not [c for c in logger.warning.call_args_list if "skip_system_message_in_guardrail" in str(c)]
+
+
+REPLY = {"choices": [{"message": {"content": "OK"}}]}
+RESPONSES_OUTPUT = {"output": [{"type": "message", "content": [{"type": "output_text", "text": "OK"}]}]}
+
+
+@pytest.mark.usefixtures("_clean_env")
+class TestXecGuardResponseScanHistory:
+    """XecGuard rejects a scan with no user turn (HTTP 400), so the reply must be
+    sent together with the request that produced it, whatever the endpoint."""
+
+    ASSISTANT = {"role": "assistant", "content": "OK"}
+
+    @pytest.mark.asyncio
+    async def test_responses_api_reply_is_scanned_after_its_instructions_and_input(self):
+        body = {"instructions": SYSTEM_PROMPT, "input": USER_PROMPT, "response": RESPONSES_OUTPUT}
+        sent = await _sent_messages(_extension_guardrail(), body, {"texts": ["OK"]}, "response")
+        assert sent == [*FULL_CONVERSATION, self.ASSISTANT]
+
+    @pytest.mark.asyncio
+    async def test_responses_api_input_items_are_flattened_into_turns(self):
+        body = {
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "a"}, {"type": "input_text", "text": "b"}]},
+                {"role": "assistant", "content": "earlier"},
+                {"role": "user", "content": "last"},
+            ],
+            "response": RESPONSES_OUTPUT,
+        }
+        sent = await _sent_messages(_extension_guardrail(), body, {"texts": ["OK"]}, "response")
+        assert sent == [
+            {"role": "user", "content": "a\nb"},
+            {"role": "assistant", "content": "earlier"},
+            {"role": "user", "content": "last"},
+            self.ASSISTANT,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_anthropic_reply_keeps_the_top_level_system_prompt(self):
+        body = {
+            "system": SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": USER_PROMPT}],
+            "response": {"content": [{"type": "text", "text": "OK"}], "role": "assistant"},
+        }
+        sent = await _sent_messages(_extension_guardrail(), body, {"texts": ["OK"]}, "response")
+        assert sent == [*FULL_CONVERSATION, self.ASSISTANT]
+
+    @pytest.mark.asyncio
+    async def test_anthropic_system_given_as_content_blocks_is_flattened(self):
+        body = {
+            "system": [{"type": "text", "text": "S1"}, {"type": "text", "text": "S2"}],
+            "messages": [{"role": "user", "content": "q"}],
+            "response": {"content": [{"type": "text", "text": "OK"}]},
+        }
+        sent = await _sent_messages(_extension_guardrail(), body, {"texts": ["OK"]}, "response")
+        assert sent[0] == {"role": "system", "content": "S1\nS2"}
+
+    @pytest.mark.asyncio
+    async def test_chat_reply_is_unchanged(self):
+        body = {"messages": FULL_CONVERSATION, "response": REPLY}
+        sent = await _sent_messages(_extension_guardrail(), body, {"texts": ["OK"]}, "response")
+        assert sent == [*FULL_CONVERSATION, self.ASSISTANT]
+
+    @pytest.mark.asyncio
+    async def test_a_chat_body_that_already_has_a_system_turn_gets_no_second_one(self):
+        body = {"system": "ignored for chat", "messages": FULL_CONVERSATION, "response": REPLY}
+        sent = await _sent_messages(_extension_guardrail(), body, {"texts": ["OK"]}, "response")
+        assert [m["role"] for m in sent] == ["system", "user", "assistant"]
+
+    @pytest.mark.asyncio
+    async def test_reply_text_falls_back_to_inputs_texts_when_the_response_has_no_choices(self):
+        body = {"input": USER_PROMPT, "response": RESPONSES_OUTPUT}
+        sent = await _sent_messages(_extension_guardrail(), body, {"texts": ["from texts"]}, "response")
+        assert sent == [{"role": "user", "content": USER_PROMPT}, {"role": "assistant", "content": "from texts"}]
+
+    @pytest.mark.asyncio
+    async def test_a_body_with_no_recognised_input_still_sends_only_the_reply(self):
+        # e.g. Gemini contents: nothing to rebuild the request from, behaviour is unchanged
+        sent = await _sent_messages(_extension_guardrail(), {"contents": []}, {"texts": ["OK"]}, "response")
+        assert sent == [self.ASSISTANT]
+
+    @pytest.mark.asyncio
+    async def test_an_unparseable_responses_input_does_not_break_the_scan(self):
+        body = {"input": 123, "response": RESPONSES_OUTPUT}
+        sent = await _sent_messages(_extension_guardrail(), body, {"texts": ["OK"]}, "response")
+        assert sent == [self.ASSISTANT]
+
+    @pytest.mark.asyncio
+    async def test_a_failing_litellm_transformation_falls_back_to_the_reply_alone(self):
+        body = {"input": USER_PROMPT, "response": RESPONSES_OUTPUT}
+        target = (
+            "litellm.responses.litellm_completion_transformation.transformation."
+            "LiteLLMCompletionResponsesConfig.transform_responses_api_input_to_messages"
+        )
+        with patch(target, side_effect=RuntimeError("shape litellm no longer supports")):
+            sent = await _sent_messages(_extension_guardrail(), body, {"texts": ["OK"]}, "response")
+        assert sent == [self.ASSISTANT]
+
+    @pytest.mark.asyncio
+    async def test_a_reply_with_no_text_is_not_scanned(self):
+        body = {"messages": FULL_CONVERSATION, "response": {"choices": [{"message": {"content": None}}]}}
+        assert await _sent_messages(_extension_guardrail(), body, {"texts": []}, "response") is None
