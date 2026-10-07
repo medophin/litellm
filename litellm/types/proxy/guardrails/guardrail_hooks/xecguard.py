@@ -48,7 +48,7 @@ class XecGuardConfigModel(GuardrailConfigModel):
             "options": list(XECGUARD_DEFAULT_POLICY_OPTIONS),
         },
     )
-    custom_policy_names: str | list[str] | None = Field(  # mutable-ok: list sets UI type; Sequence ambiguous
+    custom_policy_names: str | None = Field(
         default=None,
         description=(
             "Additional policy names that are not in the list above, such as "
@@ -65,7 +65,7 @@ class XecGuardConfigModel(GuardrailConfigModel):
             "send them."
         ),
     )
-    apply_to_aliases: str | list[str] | None = Field(  # mutable-ok: list sets UI type; Sequence ambiguous
+    apply_to_aliases: str | None = Field(
         default=None,
         description=(
             "Allowlist of virtual-key aliases: only requests from keys whose "
@@ -74,7 +74,7 @@ class XecGuardConfigModel(GuardrailConfigModel):
             "list or a comma-separated string."
         ),
     )
-    except_aliases: str | list[str] | None = Field(  # mutable-ok: list sets UI type; Sequence ambiguous
+    except_aliases: str | None = Field(
         default=None,
         description=(
             "Exclude list of virtual-key aliases: requests from keys whose alias "
@@ -96,7 +96,7 @@ class XecGuardConfigModel(GuardrailConfigModel):
             "var."
         ),
     )
-    meta_data_fields: str | list[str] | None = Field(  # mutable-ok: list sets UI type; Sequence ambiguous
+    meta_data_fields: str | None = Field(
         default=None,
         description=(
             "Restrict which of the virtual key's metadata fields are forwarded "
@@ -109,7 +109,7 @@ class XecGuardConfigModel(GuardrailConfigModel):
             "comma-separated string. Only used when `send_meta` is enabled."
         ),
     )
-    custom_header_meta_fields: str | list[str] | None = Field(  # mutable-ok: list sets UI type; Sequence ambiguous
+    custom_header_meta_fields: str | None = Field(
         default=None,
         description=(
             "Request headers to forward into `meta.data`, named as the caller "
@@ -196,15 +196,16 @@ class XecGuardConfigModel(GuardrailConfigModel):
         mode="before",
     )
     @classmethod
-    def _normalize_alias_list(cls, v: object) -> object:
-        """Accept either a list or a comma-separated string (the UI submits a
-        plain text box as a string; YAML users may write a list) and normalize
-        to a de-whitespaced, empties-dropped list of aliases / field names."""
+    def _normalize_list_field(cls, v: object) -> object:
+        """Store these as one comma-separated string. The admin UI renders them as a
+        plain text box and shows a list as an empty box, so the API must hand back a
+        string. A YAML list (or a legacy list already in the database) is joined;
+        entries are stripped and empties dropped."""
         if v is None:
             return None
         items: Final = v.split(",") if isinstance(v, str) else v
         if isinstance(items, (list, tuple)):
-            return [s.strip() for s in items if isinstance(s, str) and s.strip()]  # mutable-ok: tests assert this list
+            return ",".join(s.strip() for s in items if isinstance(s, str) and s.strip())
         return v
 
     @staticmethod

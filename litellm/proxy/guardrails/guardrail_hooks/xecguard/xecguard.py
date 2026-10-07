@@ -121,6 +121,15 @@ def _poc_dump(hook: str, guardrail_name: str | None, **fields: object) -> None:
         verbose_proxy_logger.debug("XecGuard PoC dump failed (ignored): %s", exc)
 
 
+def _split_list_param(value: str | Sequence[str] | None) -> tuple[str, ...]:
+    """Items of a list-valued setting that is stored as a comma-separated string
+    (what the admin UI text box submits) or written as a YAML list."""
+    if not value:
+        return ()
+    raw: Final = value.split(",") if isinstance(value, str) else value
+    return tuple(item.strip() for item in raw if isinstance(item, str) and item.strip())
+
+
 def _sanitize_scan_result_for_logging(scan_result: dict) -> dict:
     without_secrets: Final = {key: value for key, value in scan_result.items() if key != "secret_fields"}
     redacted: Final = redact_nested_match_and_regex_keys(without_secrets)
@@ -227,13 +236,13 @@ class XecGuardGuardrail(CustomGuardrail):
         api_base: str | None = None,
         xecguard_model: str | None = None,
         policy_names: list[str] | None = None,
-        custom_policy_names: Sequence[str] | None = None,
+        custom_policy_names: str | Sequence[str] | None = None,
         custom_policy_min_chars: int | None = None,
-        apply_to_aliases: Sequence[str] | None = None,
-        except_aliases: Sequence[str] | None = None,
+        apply_to_aliases: str | Sequence[str] | None = None,
+        except_aliases: str | Sequence[str] | None = None,
         send_meta: bool | None = None,
-        meta_data_fields: Sequence[str] | None = None,
-        custom_header_meta_fields: Sequence[str] | None = None,
+        meta_data_fields: str | Sequence[str] | None = None,
+        custom_header_meta_fields: str | Sequence[str] | None = None,
         meta_identity_format: str | None = None,
         block_on_error: bool | None = None,
         grounding_strictness: str | None = None,
@@ -256,11 +265,11 @@ class XecGuardGuardrail(CustomGuardrail):
 
         self.xecguard_model = xecguard_model or _DEFAULT_MODEL
         self.policy_names = policy_names
-        self.custom_policy_names = tuple(custom_policy_names) if custom_policy_names else ()
+        self.custom_policy_names = _split_list_param(custom_policy_names)
         self.custom_policy_min_chars = custom_policy_min_chars
         # Guardrail-side key targeting (free, OSS). Normalized to lists.
-        self.apply_to_aliases = apply_to_aliases or ()
-        self.except_aliases = except_aliases or ()
+        self.apply_to_aliases = _split_list_param(apply_to_aliases)
+        self.except_aliases = _split_list_param(except_aliases)
 
         # Caller context forwarded as the scan payload's ``meta``. Opt-in: turning
         # it on sends the calling key's alias and its admin-set metadata to
@@ -273,13 +282,13 @@ class XecGuardGuardrail(CustomGuardrail):
             )
         else:
             self.send_meta = send_meta
-        self.meta_data_fields = tuple(meta_data_fields) if meta_data_fields else ()
+        self.meta_data_fields = _split_list_param(meta_data_fields)
         # Request headers to forward into meta.data, named as the caller sends
         # them (e.g. "ComputerName"). Matched against proxy_server_request.headers
         # case-insensitively (the proxy lower-cases header names before storing
         # them); the meta.data field name is derived from the configured header
         # name - see _custom_header_meta_items.
-        self.custom_header_meta_fields = tuple(custom_header_meta_fields) if custom_header_meta_fields else ()
+        self.custom_header_meta_fields = _split_list_param(custom_header_meta_fields)
 
         # Wire shape of ``meta.virtualkey``. Defaults to the string form: a backend
         # that only accepts strings answers the object form with 400, and with

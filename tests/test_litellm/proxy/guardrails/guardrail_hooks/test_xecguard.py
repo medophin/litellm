@@ -1099,7 +1099,7 @@ class TestXecGuardCustomPolicyThreshold:
         from litellm.types.proxy.guardrails.guardrail_hooks.xecguard import XecGuardConfigModel
 
         model = XecGuardConfigModel(custom_policy_names="  Fruit_Detection , Other_Policy ,")
-        assert model.custom_policy_names == ["Fruit_Detection", "Other_Policy"]
+        assert model.custom_policy_names == "Fruit_Detection,Other_Policy"
 
 
 class TestXecGuardMessageAssembly:
@@ -2413,9 +2413,9 @@ class TestXecGuardInitializer:
         assert cb.xecguard_model == "xecguard_v2"
         assert cb.policy_names == ["Default_Policy_SkillsProtection"]
         assert cb.custom_policy_min_chars == 500
-        # the alias lists keep the normalized list the config model produced
-        assert cb.apply_to_aliases == ["key-allow"]
-        assert cb.except_aliases == ["key-deny"]
+        # the config model hands the guardrail comma-separated strings; the guardrail splits them
+        assert cb.apply_to_aliases == ("key-allow",)
+        assert cb.except_aliases == ("key-deny",)
         assert cb.send_meta is True
         assert cb.meta_data_fields == ("cost_center", "owner")
         assert cb.meta_identity_format == "object"
@@ -2597,13 +2597,13 @@ class TestXecGuardAliasConfigModel:
     def test_validator_splits_comma_separated_string(self):
         # The UI submits a plain text box as a single string.
         cfg = XecGuardConfigModel(apply_to_aliases="prod, staging ,  ,dev")
-        assert cfg.apply_to_aliases == ["prod", "staging", "dev"]
+        assert cfg.apply_to_aliases == "prod,staging,dev"
 
     def test_validator_passes_list_through_and_cleans(self):
         # YAML users may write a list; non-str / empty entries are dropped and
         # surviving strings are stripped.
         cfg = XecGuardConfigModel(except_aliases=["  a ", "b", "", 5, None])
-        assert cfg.except_aliases == ["a", "b"]
+        assert cfg.except_aliases == "a,b"
 
     def test_validator_none_stays_none(self):
         cfg = XecGuardConfigModel()
@@ -3235,7 +3235,7 @@ class TestXecGuardScanMeta:
 
     def test_config_model_normalizes_meta_data_fields(self):
         cfg = XecGuardConfigModel(meta_data_fields="cost_center, owner ")
-        assert cfg.meta_data_fields == ["cost_center", "owner"]
+        assert cfg.meta_data_fields == "cost_center,owner"
         assert XecGuardConfigModel().meta_data_fields is None
 
     def test_an_explicit_none_stays_none(self):
@@ -3903,3 +3903,65 @@ class TestXecGuardOtelRequestContext:
             )
         ctx = self._entry(request_data)["guardrail_response"]["request_context"]
         assert ctx == {"trace_id": "tr-3"}
+
+
+@pytest.mark.usefixtures("_clean_env")
+class TestXecGuardListFieldsRoundTripThroughTheUi:
+    """The admin UI renders these fields as a plain text box. Whatever the API
+    hands back must be a string, or the box shows up empty after a refresh."""
+
+    FIELDS = (
+        "apply_to_aliases",
+        "except_aliases",
+        "meta_data_fields",
+        "custom_header_meta_fields",
+        "custom_policy_names",
+    )
+
+    def test_every_list_field_is_declared_as_a_text_box_in_the_ui(self):
+        from litellm.types.proxy.guardrails.guardrail_hooks.xecguard import XecGuardConfigModel
+
+        schema = XecGuardConfigModel.model_json_schema()["properties"]
+        for name in self.FIELDS:
+            assert "array" not in str(schema[name].get("anyOf", schema[name])), name
+
+    @pytest.mark.parametrize("name", FIELDS)
+    def test_a_list_from_yaml_comes_back_as_a_string(self, name):
+        cfg = XecGuardConfigModel(**{name: ["a", " b ", "", "c"]})
+        assert getattr(cfg, name) == "a,b,c"
+
+    @pytest.mark.parametrize("name", FIELDS)
+    def test_the_dumped_value_the_api_returns_is_a_string(self, name):
+        from litellm.types.guardrails import LitellmParams
+
+        params = LitellmParams(guardrail="xecguard", mode="pre_call", **{name: "x, y"})
+        assert params.model_dump(exclude_none=True)[name] == "x,y"
+
+    @pytest.mark.parametrize("name", FIELDS)
+    def test_a_legacy_list_already_in_the_database_is_still_accepted(self, name):
+        from litellm.types.guardrails import LitellmParams
+
+        params = LitellmParams(guardrail="xecguard", mode="pre_call", **{name: ["x", "y"]})
+        assert params.model_dump(exclude_none=True)[name] == "x,y"
+
+    @pytest.mark.parametrize("name", FIELDS)
+    def test_the_guardrail_splits_the_string_back_into_items(self, name):
+        gr = _extension_guardrail(**{name: "x,y"})
+        assert tuple(getattr(gr, name)) == ("x", "y")
+
+    @pytest.mark.parametrize("name", FIELDS)
+    def test_the_guardrail_still_accepts_a_plain_list(self, name):
+        gr = _extension_guardrail(**{name: ["x", "y"]})
+        assert tuple(getattr(gr, name)) == ("x", "y")
+
+    @pytest.mark.parametrize("name", FIELDS)
+    def test_the_guardrail_strips_whitespace_and_drops_empty_items(self, name):
+        gr = _extension_guardrail(**{name: " x ,, y , "})
+        assert tuple(getattr(gr, name)) == ("x", "y")
+        gr_list = _extension_guardrail(**{name: [" x ", "", "y "]})
+        assert tuple(getattr(gr_list, name)) == ("x", "y")
+
+    @pytest.mark.parametrize("name", FIELDS)
+    def test_empty_and_none_mean_no_items(self, name):
+        assert tuple(getattr(_extension_guardrail(**{name: ""}), name)) == ()
+        assert tuple(getattr(_extension_guardrail(**{name: None}), name)) == ()
