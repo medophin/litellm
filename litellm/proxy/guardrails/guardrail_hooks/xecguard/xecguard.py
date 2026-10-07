@@ -51,6 +51,9 @@ from litellm.integrations.custom_guardrail import (
 )
 from litellm.litellm_core_utils.core_helpers import redact_nested_match_and_regex_keys
 from litellm.litellm_core_utils.sensitive_data_masker import mask_credentials_in_payload
+from litellm.llms.base_llm.guardrail_translation.utils import (
+    effective_skip_system_message_for_guardrail,
+)
 from litellm.llms.custom_httpx.http_handler import (
     get_async_httpx_client,
     httpxSpecialProvider,
@@ -328,6 +331,7 @@ class XecGuardGuardrail(CustomGuardrail):
         self.stream_chunk = max(1, stream_chunk)
         self.stream_context = max(0, stream_context)
         self.stream_first = stream_first
+        self._warned_system_stripped = False
 
         self.async_handler = get_async_httpx_client(
             llm_provider=httpxSpecialProvider.GuardrailCallback,
@@ -1182,6 +1186,24 @@ class XecGuardGuardrail(CustomGuardrail):
         }
         return (call_message, result_message), "input"
 
+    def _conversation_source(self, request_data: dict, inputs: Any, input_type: str) -> list[Any]:
+        structured: Final = inputs.get("structured_messages") if isinstance(inputs, dict) else None
+        if input_type == "request" and isinstance(structured, list) and structured:
+            self._warn_once_if_system_prompt_is_stripped()
+            return structured
+        return request_data.get("messages") or []
+
+    def _warn_once_if_system_prompt_is_stripped(self) -> None:
+        if self._warned_system_stripped or not effective_skip_system_message_for_guardrail(self):
+            return
+        self._warned_system_stripped = True
+        verbose_proxy_logger.warning(
+            "XecGuard %s: skip_system_message_in_guardrail is in effect, so the system prompt is "
+            "removed before the scan and policies that depend on it (e.g. SystemPromptEnforcement) "
+            "may miss violations. Set it to false on this guardrail to keep the system prompt.",
+            self.guardrail_name,
+        )
+
     def _build_full_history(
         self,
         request_data: dict,
@@ -1190,12 +1212,15 @@ class XecGuardGuardrail(CustomGuardrail):
     ) -> list[dict]:
         """Assemble the full message list that will be sent to XecGuard.
 
-        Always reads from ``request_data['messages']`` so the framework's
-        optional ``skip_system_message_in_guardrail`` filter cannot strip
-        system prompts. Synthesises a trailing user/assistant message when
-        the request data is incomplete.
+        On the request side the conversation comes from ``inputs['structured_messages']``,
+        which litellm builds for every endpoint (chat, Anthropic ``system`` + ``messages``,
+        Responses ``instructions`` + ``input``) in the same OpenAI shape, system prompt
+        included. Only when it is absent (an older litellm, or a direct
+        ``/apply_guardrail`` call) does this fall back to ``request_data['messages']``,
+        which exists only for bodies that are already chat-shaped. Synthesises a trailing
+        user/assistant message when the data is incomplete.
         """
-        raw_messages: Final = request_data.get("messages") or []
+        raw_messages: Final = self._conversation_source(request_data, inputs, input_type)
         messages: Final[list[dict]] = [self._normalize_message(m) for m in raw_messages if isinstance(m, dict)]
 
         if input_type == "request":
