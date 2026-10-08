@@ -260,3 +260,71 @@ guardrails:
       default_on: true
       policy_names:
         - Default_Policy_GeneralPromptAttackProtection
+
+  - guardrail_name: "fruit_stream_window"
+    litellm_params:
+      guardrail: xecguard
+      mode: post_call
+      api_key: os.environ/XECGUARD_API_KEY
+      api_base: https://api-staging-xec.cycraft.ai/
+      default_on: false
+      stream_mode: window
+      stream_chunk: 5
+      stream_context: 2
+      stream_first: true
+      policy_names: []
+      custom_policy_names:
+        - Fruit_Detection
+      custom_policy_min_chars: 0
+
+  - guardrail_name: "fruit_stream_window_hold"
+    litellm_params:
+      guardrail: xecguard
+      mode: post_call
+      api_key: os.environ/XECGUARD_API_KEY
+      api_base: https://api-staging-xec.cycraft.ai/
+      default_on: false
+      stream_mode: window
+      stream_chunk: 5
+      stream_context: 2
+      stream_first: false
+      policy_names: []
+      custom_policy_names:
+        - Fruit_Detection
+      custom_policy_min_chars: 0
+
+  - guardrail_name: "fruit_stream_buffer"
+    litellm_params:
+      guardrail: xecguard
+      mode: post_call
+      api_key: os.environ/XECGUARD_API_KEY
+      api_base: https://api-staging-xec.cycraft.ai/
+      default_on: false
+      stream_mode: buffer
+      policy_names: []
+      custom_policy_names:
+        - Fruit_Detection
+      custom_policy_min_chars: 0
+
+  - guardrail_name: "fruit_nomin_pre"
+    litellm_params:
+      guardrail: xecguard
+      mode: pre_call
+      api_key: os.environ/XECGUARD_API_KEY
+      api_base: https://api-staging-xec.cycraft.ai/
+      default_on: false
+      policy_names: []
+      custom_policy_names:
+        - Fruit_Detection
+      custom_policy_min_chars: 0
+
+  - guardrail_name: "fruit_default_min"
+    litellm_params:
+      guardrail: xecguard
+      mode: pre_call
+      api_key: os.environ/XECGUARD_API_KEY
+      api_base: https://api-staging-xec.cycraft.ai/
+      default_on: false
+      policy_names: []
+      custom_policy_names:
+        - Fruit_Detection
