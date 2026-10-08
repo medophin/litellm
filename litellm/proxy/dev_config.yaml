@@ -328,3 +328,38 @@ guardrails:
       policy_names: []
       custom_policy_names:
         - Fruit_Detection
+
+  - guardrail_name: "sysprompt_enforce_pre"
+    litellm_params:
+      guardrail: xecguard
+      mode: pre_call
+      api_key: os.environ/XECGUARD_API_KEY
+      api_base: https://api-staging-xec.cycraft.ai/
+      default_on: false
+      policy_names:
+        - Default_Policy_SystemPromptEnforcement
+
+  - guardrail_name: "sysprompt_stream_window"
+    litellm_params:
+      guardrail: xecguard
+      mode: post_call
+      api_key: os.environ/XECGUARD_API_KEY
+      api_base: https://api-staging-xec.cycraft.ai/
+      default_on: false
+      stream_mode: window
+      stream_chunk: 10
+      stream_context: 4
+      stream_first: true
+      policy_names:
+        - Default_Policy_SystemPromptEnforcement
+
+  - guardrail_name: "sysprompt_stream_buffer"
+    litellm_params:
+      guardrail: xecguard
+      mode: post_call
+      api_key: os.environ/XECGUARD_API_KEY
+      api_base: https://api-staging-xec.cycraft.ai/
+      default_on: false
+      stream_mode: buffer
+      policy_names:
+        - Default_Policy_SystemPromptEnforcement
