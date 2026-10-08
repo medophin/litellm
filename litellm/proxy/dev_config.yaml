@@ -363,3 +363,23 @@ guardrails:
       stream_mode: buffer
       policy_names:
         - Default_Policy_SystemPromptEnforcement
+
+  - guardrail_name: "matrix_in"
+    litellm_params:
+      guardrail: xecguard
+      mode: pre_call
+      api_key: os.environ/XECGUARD_API_KEY
+      api_base: https://api-staging-xec.cycraft.ai/
+      default_on: false
+      policy_names:
+        - Default_Policy_PIISensitiveDataProtection
+
+  - guardrail_name: "matrix_out"
+    litellm_params:
+      guardrail: xecguard
+      mode: post_call
+      api_key: os.environ/XECGUARD_API_KEY
+      api_base: https://api-staging-xec.cycraft.ai/
+      default_on: false
+      policy_names:
+        - Default_Policy_PIISensitiveDataProtection
