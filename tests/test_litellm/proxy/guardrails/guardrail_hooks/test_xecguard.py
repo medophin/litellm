@@ -4259,3 +4259,313 @@ class TestXecGuardResponseScanHistory:
     async def test_a_reply_with_no_text_is_not_scanned(self):
         body = {"messages": FULL_CONVERSATION, "response": {"choices": [{"message": {"content": None}}]}}
         assert await _sent_messages(_extension_guardrail(), body, {"texts": []}, "response") is None
+
+
+# ---------------------------------------------------------------------------
+# Streaming across routes (chat, /v1/responses)
+# ---------------------------------------------------------------------------
+
+from litellm.types.llms.openai import (  # noqa: E402
+    OutputTextDeltaEvent,
+    ResponseCreatedEvent,
+)
+
+
+def _responses_delta(text: str) -> OutputTextDeltaEvent:
+    return OutputTextDeltaEvent(
+        type="response.output_text.delta", delta=text, item_id="msg_1", output_index=0, content_index=0
+    )
+
+
+def _created_event() -> ResponseCreatedEvent:
+    return ResponseCreatedEvent(
+        type="response.created",
+        response={"id": "resp_1", "object": "response", "created_at": 1, "output": [], "status": "in_progress"},
+    )
+
+
+async def _responses_stream(pieces: list[str], tracker: list | None = None):
+    """What /v1/responses streams: lifecycle events with no text between the
+    output_text.delta events that carry it."""
+    yield _created_event()
+    for piece in pieces:
+        if tracker is not None:
+            tracker.append(piece)
+        yield _responses_delta(piece)
+
+
+RESPONSES_BODY = {"model": "m", "instructions": SYSTEM_PROMPT, "input": USER_PROMPT}
+UNSAFE_SCAN = {
+    "decision": "UNSAFE",
+    "trace_id": "trace-r",
+    "xecguard_result": [{"violated_policy_name": "PolicyX", "rationale": "bad"}],
+}
+
+
+def _route_user(route: str) -> MagicMock:
+    user = MagicMock()
+    user.request_route = route
+    return user
+
+
+async def _drain(gen) -> list:
+    return [item async for item in gen]
+
+
+def _block_text(blocks: list) -> str:
+    return b"".join(b if isinstance(b, bytes) else b.encode() for b in blocks).decode()
+
+
+@pytest.mark.usefixtures("_clean_env")
+class TestXecGuardStreamChunkText:
+    def test_chat_chunk_text_is_read_from_the_delta(self):
+        assert XecGuardGuardrail._chunk_delta_text(_stream_chunk("hi")) == "hi"
+
+    def test_responses_text_delta_event_text_is_read_from_delta(self):
+        assert XecGuardGuardrail._chunk_delta_text(_responses_delta("你好")) == "你好"
+
+    def test_responses_lifecycle_events_carry_no_text(self):
+        assert XecGuardGuardrail._chunk_delta_text(_created_event()) == ""
+
+    def test_a_responses_dict_event_is_read_too(self):
+        assert XecGuardGuardrail._chunk_delta_text({"type": "response.output_text.delta", "delta": "x"}) == "x"
+
+    def test_a_text_done_event_is_not_counted_twice(self):
+        done = {"type": "response.output_text.done", "text": "whole text"}
+        assert XecGuardGuardrail._chunk_delta_text(done) == ""
+
+    def test_an_unknown_object_yields_no_text(self):
+        assert XecGuardGuardrail._chunk_delta_text(object()) == ""
+
+
+@pytest.mark.usefixtures("_clean_env")
+class TestXecGuardStreamingResponses:
+    @staticmethod
+    def _guardrail(**kw):
+        return XecGuardGuardrail(
+            api_key="xgs_test", stream_mode=kw.pop("stream_mode", "window"), stream_chunk=2, stream_context=1, **kw
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_window_scan_sees_the_streamed_text_and_the_request(self):
+        gr = self._guardrail()
+        scan = AsyncMock(return_value={"decision": "SAFE"})
+        with patch.object(gr, "_call_scan", new=scan):
+            await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=_route_user("/v1/responses"),
+                    response=_responses_stream(["ab", "cd", "ef", "gh"]),
+                    request_data=dict(RESPONSES_BODY),
+                )
+            )
+        # the lifecycle event takes a slot but has no text, so window 1 is created + "ab"; each later
+        # window repeats `stream_context` (1) earlier piece, then adds the next `stream_chunk` (2) pieces
+        windows = [c.kwargs["messages"][-1]["content"] for c in scan.call_args_list]
+        assert windows == ["ab", "abcdef", "efgh"]
+        for call in scan.call_args_list:
+            assert call.kwargs["messages"][:-1] == FULL_CONVERSATION
+
+    @pytest.mark.asyncio
+    async def test_a_safe_responses_stream_is_passed_through_untouched(self):
+        gr = self._guardrail()
+        with patch.object(gr, "_call_scan", new=AsyncMock(return_value={"decision": "SAFE"})):
+            out = await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=_route_user("/v1/responses"),
+                    response=_responses_stream(["a", "b", "c", "d"]),
+                    request_data=dict(RESPONSES_BODY),
+                )
+            )
+        assert [getattr(c, "delta", None) for c in out if hasattr(c, "delta")] == ["a", "b", "c", "d"]
+        assert len(out) == 5  # the created event is kept
+
+    @pytest.mark.asyncio
+    async def test_an_unsafe_responses_stream_ends_with_a_valid_responses_block(self):
+        gr = self._guardrail()
+        with patch.object(gr, "_call_scan", new=AsyncMock(return_value=UNSAFE_SCAN)):
+            out = await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=_route_user("/v1/responses"),
+                    response=_responses_stream(["a", "b", "c", "d"]),
+                    request_data=dict(RESPONSES_BODY),
+                )
+            )
+        tail = _block_text([c for c in out if isinstance(c, bytes)])
+        assert "response.completed" in tail
+        assert "trace-r" in tail and "PolicyX" in tail
+
+    @pytest.mark.asyncio
+    async def test_a_block_after_released_chunks_continues_the_open_response(self):
+        gr = self._guardrail()  # stream_first on: the first window is already with the client
+        with patch.object(gr, "_call_scan", new=AsyncMock(return_value=UNSAFE_SCAN)):
+            out = await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=_route_user("/v1/responses"),
+                    response=_responses_stream(["a", "b", "c", "d"]),
+                    request_data=dict(RESPONSES_BODY),
+                )
+            )
+        assert any(hasattr(c, "delta") for c in out)
+        assert not any(isinstance(c, bytes) and b"response.created" in c for c in out)
+
+    @pytest.mark.asyncio
+    async def test_a_block_before_anything_was_released_is_a_whole_standalone_response(self):
+        gr = self._guardrail(stream_first=False)
+        with patch.object(gr, "_call_scan", new=AsyncMock(return_value=UNSAFE_SCAN)):
+            out = await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=_route_user("/v1/responses"),
+                    response=_responses_stream(["secret1", "secret2", "c", "d"]),
+                    request_data=dict(RESPONSES_BODY),
+                )
+            )
+        assert all(isinstance(c, bytes) for c in out)
+        text = _block_text(out)
+        assert "response.created" in text and "response.completed" in text
+        assert "secret1" not in text
+
+    @pytest.mark.asyncio
+    async def test_hold_mode_releases_each_scanned_batch_before_a_later_block(self):
+        gr = self._guardrail(stream_first=False)
+        with patch.object(
+            gr, "_call_scan", new=AsyncMock(side_effect=[{"decision": "SAFE"}, UNSAFE_SCAN])
+        ):
+            out = await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=_route_user("/v1/responses"),
+                    response=_responses_stream(["a", "bad1", "bad2", "bad3"]),
+                    request_data=dict(RESPONSES_BODY),
+                )
+            )
+        released = [c.delta for c in out if hasattr(c, "delta")]
+        assert released == ["a"]
+        block = _block_text([c for c in out if isinstance(c, bytes)])
+        assert "bad1" not in block
+        # the client already holds the first batch, so the block must continue that response
+        assert "response.created" not in block and "response.completed" in block
+
+    @pytest.mark.asyncio
+    async def test_buffer_mode_replays_the_original_responses_events_when_safe(self):
+        gr = self._guardrail(stream_mode="buffer")
+        scan = AsyncMock(return_value={"decision": "SAFE"})
+        with patch.object(gr, "_call_scan", new=scan):
+            out = await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=_route_user("/v1/responses"),
+                    response=_responses_stream(["Hello ", "world"]),
+                    request_data=dict(RESPONSES_BODY),
+                )
+            )
+        assert [c.delta for c in out if hasattr(c, "delta")] == ["Hello ", "world"]
+        assert scan.call_args.kwargs["messages"] == [*FULL_CONVERSATION, {"role": "assistant", "content": "Hello world"}]
+
+    @pytest.mark.asyncio
+    async def test_buffer_mode_never_releases_unsafe_responses_text(self):
+        gr = self._guardrail(stream_mode="buffer")
+        with patch.object(gr, "_call_scan", new=AsyncMock(return_value=UNSAFE_SCAN)):
+            out = await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=_route_user("/v1/responses"),
+                    response=_responses_stream(["secret ", "content"]),
+                    request_data=dict(RESPONSES_BODY),
+                )
+            )
+        assert all(isinstance(c, bytes) for c in out)
+        assert "secret" not in _block_text(out)
+
+    @pytest.mark.asyncio
+    async def test_audit_mode_never_blocks_a_responses_stream(self):
+        gr = self._guardrail(stream_mode="audit")
+        with patch.object(gr, "_call_scan", new=AsyncMock(return_value=UNSAFE_SCAN)):
+            out = await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=_route_user("/v1/responses"),
+                    response=_responses_stream(["a", "b", "c", "d"]),
+                    request_data=dict(RESPONSES_BODY),
+                )
+            )
+        assert not any(isinstance(c, bytes) for c in out)
+
+    @pytest.mark.asyncio
+    async def test_a_scan_error_in_window_mode_still_fails_open(self):
+        gr = self._guardrail(block_on_error=True)
+        with patch.object(gr.async_handler, "post", side_effect=httpx.ConnectError("refused")):
+            out = await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=_route_user("/v1/responses"),
+                    response=_responses_stream(["a", "b", "c", "d"]),
+                    request_data=dict(RESPONSES_BODY),
+                )
+            )
+        assert [c.delta for c in out if hasattr(c, "delta")] == ["a", "b", "c", "d"]
+
+
+@pytest.mark.usefixtures("_clean_env")
+class TestXecGuardStreamingBlockFallback:
+    HANDLER = "litellm.llms.openai.responses.guardrail_translation.handler.OpenAIResponsesHandler.build_block_sse_chunks"
+
+    @pytest.mark.asyncio
+    async def test_a_failing_route_block_builder_falls_back_to_a_chat_block_chunk(self):
+        gr = XecGuardGuardrail(api_key="xgs_test", stream_mode="window", stream_chunk=2, stream_context=1)
+        with (
+            patch.object(gr, "_call_scan", new=AsyncMock(return_value=UNSAFE_SCAN)),
+            patch(self.HANDLER, side_effect=RuntimeError("builder changed")),
+        ):
+            out = await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=_route_user("/v1/responses"),
+                    response=_responses_stream(["a", "b", "c", "d"]),
+                    request_data=dict(RESPONSES_BODY),
+                )
+            )
+        last = out[-1]
+        assert not isinstance(last, bytes)
+        assert last.choices[0].finish_reason == "content_filter"
+        assert "trace-r" in last.choices[0].delta.content
+
+    @pytest.mark.asyncio
+    async def test_a_route_with_no_translation_handler_falls_back_to_a_chat_block_chunk(self):
+        gr = XecGuardGuardrail(api_key="xgs_test", stream_mode="window", stream_chunk=2, stream_context=1)
+        with patch.object(gr, "_call_scan", new=AsyncMock(return_value=UNSAFE_SCAN)):
+            out = await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=_route_user("/not/a/known/route"),
+                    response=_fake_stream(["a", "b", "c", "d"]),
+                    request_data={"messages": FULL_CONVERSATION},
+                )
+            )
+        assert out[-1].choices[0].finish_reason == "content_filter"
+
+    @pytest.mark.asyncio
+    async def test_a_missing_route_falls_back_to_a_chat_block_chunk(self):
+        gr = XecGuardGuardrail(api_key="xgs_test", stream_mode="window", stream_chunk=2, stream_context=1)
+        with patch.object(gr, "_call_scan", new=AsyncMock(return_value=UNSAFE_SCAN)):
+            out = await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=MagicMock(spec=[]),
+                    response=_fake_stream(["a", "b", "c", "d"]),
+                    request_data={"messages": FULL_CONVERSATION},
+                )
+            )
+        assert out[-1].choices[0].finish_reason == "content_filter"
+
+
+@pytest.mark.usefixtures("_clean_env")
+class TestXecGuardStreamingChatBlock:
+    @pytest.mark.asyncio
+    async def test_a_chat_block_is_still_a_chat_chunk_with_content_filter(self, mock_request_data):
+        gr = XecGuardGuardrail(api_key="xgs_test", stream_mode="window", stream_chunk=2, stream_context=1)
+        with patch.object(gr, "_call_scan", new=AsyncMock(return_value=UNSAFE_SCAN)):
+            out = await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=_route_user("/v1/chat/completions"),
+                    response=_fake_stream(["a", "b", "c", "d"]),
+                    request_data=mock_request_data,
+                )
+            )
+        blocks = [c for c in out if isinstance(c, bytes)]
+        assert blocks, "a chat block is built by the chat translation handler"
+        text = _block_text(blocks)
+        assert "trace-r" in text and "PolicyX" in text
+        assert '"finish_reason": "content_filter"' in text
+        assert text.rstrip().endswith("}")

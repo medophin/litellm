@@ -68,7 +68,6 @@ from litellm.types.utils import (
     GenericGuardrailAPIInputs,
     GuardrailStatus,
     GuardrailTracingDetail,
-    ModelResponse,
     ModelResponseStream,
     StandardLoggingGuardrailInformation,
     StreamingChoices,
@@ -677,7 +676,7 @@ class XecGuardGuardrail(CustomGuardrail):
         user_api_key_dict: "UserAPIKeyAuth",
         response: Any,
         request_data: dict,
-    ) -> AsyncGenerator[ModelResponseStream, None]:
+    ) -> AsyncGenerator[Any, None]:
         """Streaming-output scan, mode chosen by ``stream_mode``.
 
         - ``window``: rolling-window scan every ``stream_chunk`` deltas
@@ -685,31 +684,84 @@ class XecGuardGuardrail(CustomGuardrail):
           stream mid-flight. ``stream_first`` (default True) releases each
           delta before it's covered by a scan (matches NeMo's default);
           scan errors fail open (never block on a XecGuard outage).
-        - ``buffer``: collect the whole stream, scan once, then re-emit.
-          Zero leak, no token-by-token feel. Scan errors respect
-          ``block_on_error`` like every other non-streaming scan.
+        - ``buffer``: hold every event, scan the assembled text once, then
+          replay the original events. Zero leak, no token-by-token feel. Scan
+          errors respect ``block_on_error`` like every other non-streaming scan.
         - ``audit``: same cadence as ``window`` but never acts on UNSAFE -
           for observing what the window scan would have done.
+
+        What goes down the wire is whatever the route's own events are (chat
+        chunks, Responses events). A block is built by the route's litellm
+        translation handler, so it ends the stream in that route's format.
         """
+        route: Final = getattr(user_api_key_dict, "request_route", None)
         if self.stream_mode == "buffer":
-            async for chunk in self._buffer_all_and_scan(response=response, request_data=request_data):
+            async for chunk in self._buffer_all_and_scan(response=response, request_data=request_data, route=route):
                 yield chunk
             return
         async for chunk in self._window_scan_stream(
             response=response,
             request_data=request_data,
+            route=route,
             audit_only=self.stream_mode == "audit",
         ):
             yield chunk
 
     @staticmethod
     def _chunk_delta_text(chunk: Any) -> str:
+        """Text carried by one streamed event, whatever route produced it.
+
+        Chat chunks keep it in ``choices[0].delta.content``; Responses spends it
+        in ``response.output_text.delta`` events (``delta``). Every other event
+        (lifecycle, ``.done`` repeats of text already streamed) carries none.
+        """
+        event_type: Final = chunk.get("type") if isinstance(chunk, dict) else getattr(chunk, "type", None)
+        if event_type == "response.output_text.delta":
+            delta: Final = chunk.get("delta") if isinstance(chunk, dict) else getattr(chunk, "delta", None)
+            return delta if isinstance(delta, str) else ""
         choices: Final = getattr(chunk, "choices", None) or []
         if not choices:
             return ""
-        delta: Final = getattr(choices[0], "delta", None)
-        content: Final = getattr(delta, "content", None) if delta is not None else None
+        choice_delta: Final = getattr(choices[0], "delta", None)
+        content: Final = getattr(choice_delta, "content", None) if choice_delta is not None else None
         return content if isinstance(content, str) else ""
+
+    def _block_events(
+        self,
+        scan_result: dict,
+        request_data: dict,
+        route: str | None,
+        released: Sequence[Any],
+    ) -> list[Any]:
+        """The events that end a blocked stream, in the route's own format.
+
+        ``released`` is what the client already has. With nothing released the
+        block is a whole standalone response; otherwise it continues the open one.
+        """
+        from litellm.exceptions import ModifyResponseException
+        from litellm.litellm_core_utils.api_route_to_call_types import get_call_types_for_route
+        from litellm.llms import get_guardrail_translation_mapping
+        from litellm.types.utils import CallTypes
+
+        message: Final = f"[Blocked by XecGuard] {self._format_scan_block_message(scan_result)}"
+        call_types: Final = get_call_types_for_route(route) if route else None
+        if call_types:
+            try:
+                handler: Final = get_guardrail_translation_mapping(CallTypes(call_types[0].value))()
+                exc: Final = ModifyResponseException(
+                    message=message,
+                    model=str(request_data.get("model") or ""),
+                    request_data=request_data,
+                    guardrail_name=self.guardrail_name,
+                )
+                events: Final = handler.build_block_sse_chunks(
+                    exc, stream_started=bool(released), responses_so_far=list(released)
+                )
+                if events:
+                    return list(events)
+            except Exception as exc_info:
+                verbose_proxy_logger.debug("XecGuard: route block builder unavailable (%s)", exc_info)
+        return [self._build_block_stream_chunk(scan_result)]
 
     def _build_block_stream_chunk(self, scan_result: dict) -> ModelResponseStream:
         notice: Final = f"\n\n[Blocked by XecGuard] {self._format_scan_block_message(scan_result)}"
@@ -741,16 +793,19 @@ class XecGuardGuardrail(CustomGuardrail):
         self,
         response: Any,
         request_data: dict,
+        route: str | None,
         audit_only: bool,
-    ) -> AsyncGenerator[ModelResponseStream, None]:
-        base_messages: Final = self._build_full_history(request_data=request_data, inputs={}, input_type="request")
+    ) -> AsyncGenerator[Any, None]:
+        base_messages: Final = self._request_messages_for_stream(request_data)
         pieces: Final[list[str]] = []
-        held: Final[list[ModelResponseStream]] = []
+        held: Final[list[Any]] = []
+        released: Final[list[Any]] = []
         scanned = 0
 
         async for chunk in response:
             pieces.append(self._chunk_delta_text(chunk))
             if self.stream_first:
+                released.append(chunk)
                 yield chunk
             else:
                 held.append(chunk)
@@ -760,17 +815,20 @@ class XecGuardGuardrail(CustomGuardrail):
 
             result = await self._scan_stream_window(base_messages=base_messages, pieces=pieces, scanned=scanned)
             if result is not None and result.get("decision") == "UNSAFE" and not audit_only:
-                yield self._build_block_stream_chunk(result)
+                for event in self._block_events(result, request_data, route, released):
+                    yield event
                 return
             scanned = len(pieces)
             if not self.stream_first:
                 for held_chunk in held:
+                    released.append(held_chunk)
                     yield held_chunk
                 held.clear()
 
         result = await self._scan_stream_window(base_messages=base_messages, pieces=pieces, scanned=scanned)
         if result is not None and result.get("decision") == "UNSAFE" and not audit_only:
-            yield self._build_block_stream_chunk(result)
+            for event in self._block_events(result, request_data, route, released):
+                yield event
             return
         if not self.stream_first:
             for held_chunk in held:
@@ -780,34 +838,27 @@ class XecGuardGuardrail(CustomGuardrail):
         self,
         response: Any,
         request_data: dict,
-    ) -> AsyncGenerator[ModelResponseStream, None]:
-        from litellm.llms.base_llm.base_model_iterator import MockResponseIterator
-        from litellm.main import stream_chunk_builder
-
-        all_chunks: Final[list[ModelResponseStream]] = []
+        route: str | None,
+    ) -> AsyncGenerator[Any, None]:
+        all_chunks: Final[list[Any]] = []
         async for chunk in response:
             all_chunks.append(chunk)
 
-        assembled: Final = stream_chunk_builder(chunks=all_chunks)
-        if not isinstance(assembled, ModelResponse):
-            for chunk in all_chunks:
-                yield chunk
-            return
-
-        resp_text: Final = self._extract_assistant_text_from_response(assembled)
-        if resp_text is not None:
-            base_messages: Final = self._build_full_history(
-                request_data=request_data, inputs={}, input_type="request"
-            )
-            xg_messages: Final = [*base_messages, {"role": "assistant", "content": resp_text}]
+        text: Final = "".join(self._chunk_delta_text(chunk) for chunk in all_chunks)
+        if text:
+            xg_messages: Final = [*self._request_messages_for_stream(request_data), {"role": "assistant", "content": text}]
             scan_result: Final = await self._call_scan(messages=xg_messages, scan_type="response")
             if scan_result is not None and scan_result.get("decision") == "UNSAFE":
-                yield self._build_block_stream_chunk(scan_result)
+                for event in self._block_events(scan_result, request_data, route, []):
+                    yield event
                 return
 
-        mock_iter: Final = MockResponseIterator(model_response=assembled)
-        async for chunk in mock_iter:
+        for chunk in all_chunks:
             yield chunk
+
+    def _request_messages_for_stream(self, request_data: dict) -> list[dict]:
+        turns: Final = self._request_turns_from_body(request_data)
+        return [self._normalize_message(m) for m in turns if isinstance(m, dict)]
 
     # ------------------------------------------------------------------
     # Caller context (scan payload ``meta``) - SIEM correlation only
