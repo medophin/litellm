@@ -4161,6 +4161,13 @@ async def _responses_stream(pieces: list[str], tracker: list | None = None):
         yield _responses_delta(piece)
 
 
+async def _generate_content_stream(pieces: list[str]):
+    """What :streamGenerateContent sends: one SSE event per piece, as Gemini's own wire format."""
+    for piece in pieces:
+        event = {"candidates": [{"content": {"parts": [{"text": piece}], "role": "model"}, "index": 0}]}
+        yield f"data: {json.dumps(event)}\n\n".encode()
+
+
 RESPONSES_BODY = {"model": "m", "instructions": SYSTEM_PROMPT, "input": USER_PROMPT}
 UNSAFE_SCAN = {
     "decision": "UNSAFE",
@@ -4364,6 +4371,41 @@ class TestXecGuardStreamingResponses:
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": USER_PROMPT},
             ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream_mode", ["window", "buffer"])
+    async def test_a_gemini_stream_is_blocked_with_a_generate_content_event(self, stream_mode):
+        gr = self._guardrail(stream_mode=stream_mode, stream_first=False)
+        body = {"model": "m", "contents": [{"role": "user", "parts": [{"text": USER_PROMPT}]}]}
+        with patch.object(gr, "_call_scan", new=AsyncMock(return_value=UNSAFE_SCAN)):
+            out = await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=_route_user("/v1beta/models/g:streamGenerateContent"),
+                    response=_generate_content_stream(["ab", "cd", "ef", "gh"]),
+                    request_data=body,
+                )
+            )
+        events = [c for c in out if isinstance(c, bytes) and b"[Blocked by XecGuard]" in c]
+        assert len(events) == 1
+        payload = json.loads(events[0].decode().removeprefix("data: "))
+        candidate = payload["candidates"][0]
+        assert candidate["finishReason"] == "SAFETY"
+        assert "[Blocked by XecGuard]" in candidate["content"]["parts"][0]["text"]
+        assert not any(getattr(c, "choices", None) for c in out)
+
+    @pytest.mark.asyncio
+    async def test_a_stream_that_is_not_generate_content_keeps_the_openai_block_chunk(self):
+        gr = XecGuardGuardrail(api_key="xgs_test", stream_mode="buffer")
+        with patch.object(gr, "_call_scan", new=AsyncMock(return_value=UNSAFE_SCAN)):
+            out = await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=MagicMock(request_route=None),
+                    response=_fake_stream(["a", "b"]),
+                    request_data={"model": "m", "messages": FULL_CONVERSATION},
+                )
+            )
+        assert len(out) == 1
+        assert out[0].choices[0].finish_reason == "content_filter"
 
     @pytest.mark.asyncio
     async def test_buffer_mode_replays_the_original_responses_events_when_safe(self):

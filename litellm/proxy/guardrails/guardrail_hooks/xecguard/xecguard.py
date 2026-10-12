@@ -861,7 +861,25 @@ class XecGuardGuardrail(CustomGuardrail):
                     return list(events)
             except Exception as exc_info:
                 verbose_proxy_logger.debug("XecGuard: route block builder unavailable (%s)", exc_info)
-        return [self._build_block_stream_chunk(scan_result)]
+        block_chunk: Final = self._build_block_stream_chunk(scan_result)
+        return self._as_generate_content_events(request_data, block_chunk) or [block_chunk]
+
+    @staticmethod
+    def _as_generate_content_events(request_data: Mapping[str, Any], chunk: ModelResponseStream) -> list[bytes]:
+        """The block chunk as a Gemini SSE event, through litellm's own OpenAI -> Gemini stream
+        conversion, for a ``generateContent`` request whose route has no block builder."""
+        if not request_data.get("contents"):
+            return []
+        from litellm.google_genai.adapters.transformation import GoogleGenAIAdapter, GoogleGenAIStreamWrapper
+
+        try:
+            event: Final = GoogleGenAIAdapter().translate_streaming_completion_to_generate_content(
+                chunk, GoogleGenAIStreamWrapper(iter(()))
+            )
+        except Exception as exc:
+            verbose_proxy_logger.debug("XecGuard: could not convert block to a generateContent event (%s)", exc)
+            return []
+        return [f"data: {json.dumps(event)}\n\n".encode()] if event else []
 
     def _build_block_stream_chunk(self, scan_result: dict) -> ModelResponseStream:
         notice: Final = f"\n\n[Blocked by XecGuard] {self._format_scan_block_message(scan_result)}"
