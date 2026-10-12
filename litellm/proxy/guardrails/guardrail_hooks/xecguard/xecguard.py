@@ -361,6 +361,8 @@ class XecGuardGuardrail(CustomGuardrail):
 
         super().__init__(**kwargs)
 
+        self.mask_response_content = True
+
     @staticmethod
     def get_config_model() -> type["GuardrailConfigModel"] | None:
         from litellm.types.proxy.guardrails.guardrail_hooks.xecguard import (

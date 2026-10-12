@@ -4708,3 +4708,14 @@ class TestXecGuardReadsThroughLitellmTranslation:
             await gr.async_logging_hook(kwargs=kwargs, result=result, call_type="anthropic_messages")
         assert scan.call_args.kwargs["scan_type"] == "response"
         assert scan.call_args.kwargs["messages"] == [*FULL_CONVERSATION, {"role": "assistant", "content": "OK"}]
+
+
+def test_anthropic_stream_stays_on_own_iterator_hook(xecguard_guardrail):
+    """proxy/utils.py reroutes /v1/messages streams to the unified guardrail
+    unless mask_response_content is set; xecguard must keep its own hook."""
+    from litellm.proxy.utils import NON_OPENAI_STREAM_GUARDRAIL_TRANSLATION_CALL_TYPES
+    from litellm.types.utils import CallTypes
+
+    assert CallTypes.anthropic_messages in NON_OPENAI_STREAM_GUARDRAIL_TRANSLATION_CALL_TYPES
+    assert xecguard_guardrail.mask_response_content is True
+    assert getattr(xecguard_guardrail, "use_native_lifecycle_hooks", False) is not True
