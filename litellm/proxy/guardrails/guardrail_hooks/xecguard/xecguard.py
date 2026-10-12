@@ -34,10 +34,11 @@ Design notes (intentional divergences from the framework defaults):
 """
 
 import asyncio
+import copy
 import json
 import os
 import re
-from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
+from collections.abc import AsyncGenerator, Mapping, Sequence
 from datetime import datetime
 from functools import reduce
 from typing import TYPE_CHECKING, Any, Final, Literal, Optional, cast
@@ -77,6 +78,7 @@ if TYPE_CHECKING:
     from litellm.litellm_core_utils.litellm_logging import (
         Logging as LiteLLMLoggingObj,
     )
+    from litellm.llms.base_llm.guardrail_translation.base_translation import BaseTranslation
     from litellm.proxy._types import UserAPIKeyAuth
     from litellm.types.mcp import MCPPostCallResponseObject
     from litellm.types.proxy.guardrails.guardrail_hooks.base import (
@@ -226,6 +228,25 @@ def _sanitized_meta_text(text: str) -> str | None:
     """Strip control characters and cap the length, or None when nothing is left."""
     cleaned: Final = _META_CONTROL_CHARS.sub("", text)[:_META_MAX_VALUE_CHARS]
     return cleaned or None
+
+
+class _TextCapture(CustomGuardrail):
+    """Takes the reply text a litellm translation hands to ``apply_guardrail`` and nothing
+    else - how XecGuard reads a response with litellm's own per-endpoint parsing."""
+
+    def __init__(self) -> None:
+        super().__init__(guardrail_name="xecguard-text-capture")
+        self.text = ""
+
+    async def apply_guardrail(
+        self,
+        inputs: GenericGuardrailAPIInputs,
+        request_data: dict,
+        input_type: Literal["request", "response"],
+        logging_obj: Optional["LiteLLMLoggingObj"] = None,
+    ) -> GenericGuardrailAPIInputs:
+        self.text = "\n".join(t for t in inputs.get("texts") or () if t)
+        return inputs
 
 
 class XecGuardMissingCredentials(Exception):
@@ -617,24 +638,8 @@ class XecGuardGuardrail(CustomGuardrail):
 
         start_time: Final = datetime.now()
         try:
-            assistant_text: Final = self._extract_assistant_text_from_response(result)
             request_data: Final = {**kwargs}
-            if assistant_text is not None:
-                request_data["response"] = result
-                messages = self._build_full_history(
-                    request_data=request_data,
-                    inputs={},
-                    input_type="response",
-                )
-                scan_type = "response"
-            else:
-                messages = self._build_full_history(
-                    request_data=request_data,
-                    inputs={},
-                    input_type="request",
-                )
-                scan_type = "input"
-
+            messages, scan_type = await self._logged_call_history(kwargs, result, call_type)
             if not messages:
                 return kwargs, result
 
@@ -673,6 +678,38 @@ class XecGuardGuardrail(CustomGuardrail):
                 str(exc),
             )
         return kwargs, result
+
+    async def _logged_call_history(
+        self, kwargs: dict, result: Any, call_type: str
+    ) -> tuple[list[dict], Literal["input", "response"]]:
+        """The logged request and, when there is one, its reply, read by litellm's translation
+        for ``call_type``: the reply text through ``process_output_response`` and the request
+        conversation through ``get_structured_messages``."""
+        from litellm.llms import get_guardrail_translation_mapping
+        from litellm.types.utils import CallTypes
+
+        try:
+            translation: BaseTranslation | None = get_guardrail_translation_mapping(CallTypes(call_type))()
+        except ValueError:
+            translation = None
+        logged_request: Final = {
+            "model": kwargs.get("model"),
+            "messages": kwargs.get("messages"),
+            "input": kwargs.get("input"),
+            **(kwargs.get("optional_params") or {}),
+        }
+        turns: Final = self._request_turns(translation, logged_request)
+        capture: Final = _TextCapture()
+        if translation is not None and result is not None:
+            try:
+                await translation.process_output_response(
+                    response=copy.deepcopy(result), guardrail_to_apply=capture, request_data={}
+                )
+            except Exception as exc:
+                verbose_proxy_logger.debug("XecGuard logging_only: could not read the reply: %s", exc)
+        if capture.text:
+            return [*turns, {"role": "assistant", "content": capture.text}], "response"
+        return (turns if turns and turns[-1].get("role") == "user" else []), "input"
 
     def logging_hook(
         self,
@@ -747,68 +784,41 @@ class XecGuardGuardrail(CustomGuardrail):
             yield chunk
 
     @staticmethod
-    def _chunk_delta_text(chunk: Any) -> str:
-        """Text carried by one streamed event, whatever route produced it.
+    def _translation_for_route(route: str | None, sample: object = None) -> "BaseTranslation | None":
+        """litellm's own request/response translation for the endpoint this call came in on,
+        or - with no route to go by - for the response shape ``sample`` has, the way the
+        unified guardrail resolves it."""
+        from litellm.cost_calculator import (  # pyright: ignore[reportPrivateUsage]  # same resolver the unified guardrail uses
+            _infer_call_type,
+        )
+        from litellm.litellm_core_utils.api_route_to_call_types import get_call_types_for_route
+        from litellm.llms import get_guardrail_translation_mapping
+        from litellm.types.utils import CallTypes
 
-        Chat chunks keep it in ``choices[0].delta.content``; Responses spends it
-        in ``response.output_text.delta`` events (``delta``); an SSE event decoded
-        from a raw byte stream is the parsed ``data:`` JSON - Anthropic's
-        ``content_block_delta`` / ``text_delta`` or Gemini's ``candidates[].content.parts[].text``.
-        Every other event (lifecycle, ``.done`` repeats of text already streamed) carries none.
-        """
-        if isinstance(chunk, dict) and chunk.get("type") == "content_block_delta":
-            text_delta: Final = chunk.get("delta")
-            if not isinstance(text_delta, dict) or text_delta.get("type") != "text_delta":
-                return ""
-            text: Final = text_delta.get("text")
-            return text if isinstance(text, str) else ""
-        if isinstance(chunk, dict) and isinstance(candidates := chunk.get("candidates"), list):
-            return "".join(
-                part["text"]
-                for candidate in candidates
-                if isinstance(candidate, dict) and isinstance(content := candidate.get("content"), dict)
-                for part in content.get("parts") or ()
-                if isinstance(part, dict) and isinstance(part.get("text"), str)
-            )
-        event_type: Final = chunk.get("type") if isinstance(chunk, dict) else getattr(chunk, "type", None)
-        if event_type == "response.output_text.delta":
-            delta: Final = chunk.get("delta") if isinstance(chunk, dict) else getattr(chunk, "delta", None)
-            return delta if isinstance(delta, str) else ""
-        choices: Final = getattr(chunk, "choices", None) or []
-        if not choices:
-            return ""
-        choice_delta: Final = getattr(choices[0], "delta", None)
-        content: Final = getattr(choice_delta, "content", None) if choice_delta is not None else None
-        return content if isinstance(content, str) else ""
-
-    @classmethod
-    def _stream_text_reader(cls) -> "Callable[[Any], str]":
-        """Per-stream text reader. Object chunks are read directly; raw SSE bytes
-        (``/v1/messages``, Gemini ``streamGenerateContent``) are split on transport
-        boundaries, not event boundaries, so they are carried until a blank line
-        completes an event and only then parsed."""
-        pending: Final[list[str]] = [""]  # mutable-ok: the unterminated SSE tail carried between chunks
-
-        def read(chunk: Any) -> str:
-            if not isinstance(chunk, (bytes, bytearray, str)):
-                return cls._chunk_delta_text(chunk)
-            raw: Final = chunk if isinstance(chunk, str) else bytes(chunk).decode("utf-8", errors="replace")
-            *events, tail = (pending[0] + raw.replace("\r\n", "\n")).split("\n\n")
-            pending[0] = tail
-            return "".join(cls._sse_event_text(event) for event in events)
-
-        return read
-
-    @classmethod
-    def _sse_event_text(cls, event: str) -> str:
-        data: Final = "\n".join(line[5:].strip() for line in event.split("\n") if line.startswith("data:"))
-        if not data or data == "[DONE]":
-            return ""
+        call_types: Final = get_call_types_for_route(route) if route else None
+        call_type: Final = call_types[0] if call_types else _infer_call_type(None, sample)
+        if call_type is None:
+            return None
         try:
-            parsed: Final[object] = json.loads(data)
-        except json.JSONDecodeError:
+            return get_guardrail_translation_mapping(CallTypes(call_type))()
+        except ValueError:
+            return None
+
+    @classmethod
+    async def _stream_text(cls, translation: "BaseTranslation | None", chunks: Sequence[Any]) -> str:
+        """The reply text streamed so far, as litellm's translation for the route reads it.
+
+        The translation hands it to ``apply_guardrail`` as ``inputs.texts``; a capturing
+        guardrail takes it from there. Chunks are copied first because some translations
+        rewrite the list they are given.
+        """
+        if translation is None or not chunks:
             return ""
-        return cls._chunk_delta_text(parsed) if isinstance(parsed, dict) else ""
+        capture: Final = _TextCapture()
+        await translation.process_output_streaming_response(
+            responses_so_far=copy.deepcopy(list(chunks)), guardrail_to_apply=capture, request_data={}
+        )
+        return capture.text
 
     def _block_events(
         self,
@@ -859,23 +869,6 @@ class XecGuardGuardrail(CustomGuardrail):
             ]
         )
 
-    async def _scan_stream_window(
-        self,
-        base_messages: list[dict],
-        pieces: list[str],
-        scanned: int,
-        request_data: dict,
-    ) -> dict | None:
-        new_pieces: Final = pieces[scanned:]
-        if not new_pieces:
-            return None
-        overlap_start: Final = max(0, scanned - self.stream_context)
-        window_text: Final = "".join(pieces[overlap_start:scanned]) + "".join(new_pieces)
-        messages: Final = [*base_messages, {"role": "assistant", "content": window_text}]
-        return await self._call_scan(
-            messages=messages, scan_type="response", request_data=request_data, suppress_errors=True
-        )
-
     async def _window_scan_stream(
         self,
         response: Any,
@@ -883,58 +876,70 @@ class XecGuardGuardrail(CustomGuardrail):
         route: str | None,
         audit_only: bool,
     ) -> AsyncGenerator[Any, None]:
-        base_messages: Final = self._request_messages_for_stream(request_data)
-        read_text: Final = self._stream_text_reader()
-        pieces: Final[list[str]] = []
-        held: Final[list[Any]] = []
-        released: Final[list[Any]] = []
+        """Every ``stream_chunk`` events the text so far is read through litellm's translation
+        for the route; the scanned window is the text the new events added, preceded by the
+        text of the ``stream_context`` events before them."""
+        translations: Final[list[BaseTranslation | None]] = []  # mutable-ok: resolved from the first event
+        chunks: Final[list[Any]] = []  # mutable-ok: every event pulled so far, re-read for text at each window
+        scanned: Final[list[int]] = [0]  # mutable-ok: how many events the last window covered
+        held: Final[list[Any]] = []  # mutable-ok: events withheld until their window is scanned (stream_first off)
+        released: Final[list[Any]] = []  # mutable-ok: events the client already holds
         flagged: Final[list[dict]] = []  # mutable-ok: audit hits collected while the stream runs
-        last_result: dict | None = None
-        scanned = 0
+        outcome: Final[list[dict]] = []  # mutable-ok: last scan that came back, for the end-of-stream record
 
-        async def scan() -> dict | None:
-            result: Final = await self._scan_stream_window(
-                base_messages=base_messages, pieces=pieces, scanned=scanned, request_data=request_data
+        async def scan_window() -> dict | None:
+            translation: Final = translations[0] if translations else None
+            context_from: Final = max(0, scanned[0] - self.stream_context)
+            before_window: Final = await self._stream_text(translation, chunks[: scanned[0]])
+            before_context: Final = await self._stream_text(translation, chunks[:context_from])
+            text: Final = await self._stream_text(translation, chunks)
+            scanned[0] = len(chunks)
+            if len(text) <= len(before_window):
+                return None
+            messages: Final = [
+                *self._request_turns(translation, request_data),
+                {"role": "assistant", "content": text[len(before_context) :]},
+            ]
+            result: Final = await self._call_scan(
+                messages=messages, scan_type="response", request_data=request_data, suppress_errors=True
             )
-            if result is not None and result.get("decision") == "UNSAFE" and audit_only:
-                flagged.append(result)
+            if result is not None:
+                outcome[:] = [result]
+                if result.get("decision") == "UNSAFE" and audit_only:
+                    flagged.append(result)
             return result
 
         async for chunk in response:
-            pieces.append(read_text(chunk))
+            if not chunks:
+                translations.append(self._translation_for_route(route, chunk))
+            chunks.append(chunk)
             if self.stream_first:
                 released.append(chunk)
                 yield chunk
             else:
                 held.append(chunk)
-
-            if len(pieces) - scanned < self.stream_chunk:
+            if len(chunks) % self.stream_chunk:
                 continue
-
-            result = await scan()
+            result = await scan_window()
             if result is not None and result.get("decision") == "UNSAFE" and not audit_only:
                 self._record_block(request_data, result, GuardrailEventHooks.post_call)
                 for event in self._block_events(result, request_data, route, released):
                     yield event
                 return
-            last_result = result or last_result
-            scanned = len(pieces)
-            if not self.stream_first:
-                for held_chunk in held:
-                    released.append(held_chunk)
-                    yield held_chunk
-                held.clear()
+            released.extend(held)
+            for held_chunk in held:
+                yield held_chunk
+            held.clear()
 
-        result = await scan()
+        result = await scan_window() if len(chunks) % self.stream_chunk else None
         if result is not None and result.get("decision") == "UNSAFE" and not audit_only:
             self._record_block(request_data, result, GuardrailEventHooks.post_call)
             for event in self._block_events(result, request_data, route, released):
                 yield event
             return
-        self._record_stream_end(request_data, flagged, result or last_result)
-        if not self.stream_first:
-            for held_chunk in held:
-                yield held_chunk
+        self._record_stream_end(request_data, flagged, outcome[0] if outcome else None)
+        for held_chunk in held:
+            yield held_chunk
 
     def _record_stream_end(
         self,
@@ -967,11 +972,11 @@ class XecGuardGuardrail(CustomGuardrail):
         async for chunk in response:
             all_chunks.append(chunk)
 
-        read_text: Final = self._stream_text_reader()
-        text: Final = "".join(read_text(chunk) for chunk in all_chunks)
+        translation: Final = self._translation_for_route(route, all_chunks[0] if all_chunks else None)
+        text: Final = await self._stream_text(translation, all_chunks)
         if text:
             xg_messages: Final = [
-                *self._request_messages_for_stream(request_data),
+                *self._request_turns(translation, request_data),
                 {"role": "assistant", "content": text},
             ]
             scan_result: Final = await self._call_scan(
@@ -986,10 +991,6 @@ class XecGuardGuardrail(CustomGuardrail):
 
         for chunk in all_chunks:
             yield chunk
-
-    def _request_messages_for_stream(self, request_data: dict) -> list[dict]:
-        turns: Final = self._request_turns_from_body(request_data)
-        return [self._normalize_message(m) for m in turns if isinstance(m, dict)]
 
     # ------------------------------------------------------------------
     # Caller context (scan payload ``meta``) - SIEM correlation only
@@ -1366,47 +1367,53 @@ class XecGuardGuardrail(CustomGuardrail):
         }
         return (call_message, result_message), "input"
 
-    def _conversation_source(self, request_data: dict, inputs: Any, input_type: str) -> list[Any]:
-        structured: Final = inputs.get("structured_messages") if isinstance(inputs, dict) else None
-        if input_type == "request" and isinstance(structured, list) and structured:
-            self._warn_once_if_system_prompt_is_stripped()
-            return structured
-        if input_type == "response":
-            return self._request_turns_from_body(request_data)
-        return request_data.get("messages") or []
+    @staticmethod
+    def _request_route(request_data: Mapping[str, Any]) -> str | None:
+        md: Final = next(
+            (m for k in ("metadata", "litellm_metadata") if isinstance(m := request_data.get(k), dict)),
+            {},
+        )
+        route: Final = md.get("user_api_key_request_route")
+        return route if isinstance(route, str) else None
 
     @staticmethod
-    def _request_turns_from_body(request_data: dict) -> list[Any]:
-        """The request half of a response scan, rebuilt from the client's own body.
+    def _request_turns(translation: "BaseTranslation | None", request_data: dict) -> list[dict]:
+        """The request conversation, as litellm's translation for the route reads the body.
 
-        litellm gives no ``structured_messages`` after the model has answered, but the
-        body is still there, and XecGuard refuses a scan that has no user turn. A chat
-        body already carries ``messages``; Anthropic keeps ``system`` beside them and
-        Responses uses ``input`` + ``instructions``.
+        Falls back to a chat-shaped ``messages`` list when the route has no translation that
+        builds one (e.g. a direct ``/guardrails/apply_guardrail`` call).
         """
-        messages: Final = request_data.get("messages")
-        if isinstance(messages, list) and messages:
-            system: Final = request_data.get("system")
-            has_system_turn: Final = any(isinstance(m, dict) and m.get("role") == "system" for m in messages)
-            if system and not has_system_turn:
-                return [{"role": "system", "content": system}, *messages]
-            return messages
-        if request_data.get("input") is None:
-            return []
-        try:
-            from litellm.responses.litellm_completion_transformation.transformation import (
-                LiteLLMCompletionResponsesConfig,
-            )
+        structured: Final = translation.get_structured_messages(dict(request_data)) if translation else None
+        turns: Final = structured if structured else request_data.get("messages") or []
+        return [XecGuardGuardrail._normalize_message(m) for m in turns if isinstance(m, dict)]
 
-            return list(
-                LiteLLMCompletionResponsesConfig.transform_responses_api_input_to_messages(
-                    input=request_data["input"],
-                    responses_api_request=request_data,
-                )
-            )
-        except Exception as exc:
-            verbose_proxy_logger.debug("XecGuard: could not rebuild the request from a Responses body: %s", exc)
-            return []
+    def _build_full_history(
+        self,
+        request_data: dict,
+        inputs: GenericGuardrailAPIInputs,
+        input_type: str,
+    ) -> list[dict]:
+        """The conversation sent to XecGuard.
+
+        Request side: ``inputs['structured_messages']``, which litellm's translation builds
+        for every endpoint in OpenAI shape, system prompt included. Response side: the same
+        request conversation, rebuilt by that translation from the body, followed by the reply
+        text litellm extracted into ``inputs['texts']``.
+        """
+        structured: Final = inputs.get("structured_messages")
+        if input_type == "request" and structured:
+            self._warn_once_if_system_prompt_is_stripped()
+        turns: Final = (
+            [self._normalize_message(m) for m in structured]
+            if input_type == "request" and structured
+            else self._request_turns(self._translation_for_route(self._request_route(request_data)), request_data)
+        )
+        texts: Final = self._join_input_texts(inputs)
+        if input_type == "response":
+            return [*turns, {"role": "assistant", "content": texts}] if texts else []
+        if not turns or turns[-1].get("role") == "user":
+            return turns
+        return [*turns, {"role": "user", "content": texts}] if texts else []
 
     def _warn_once_if_system_prompt_is_stripped(self) -> None:
         if self._warned_system_stripped or not effective_skip_system_message_for_guardrail(self):
@@ -1418,43 +1425,6 @@ class XecGuardGuardrail(CustomGuardrail):
             "may miss violations. Set it to false on this guardrail to keep the system prompt.",
             self.guardrail_name,
         )
-
-    def _build_full_history(
-        self,
-        request_data: dict,
-        inputs: GenericGuardrailAPIInputs,
-        input_type: str,
-    ) -> list[dict]:
-        """Assemble the full message list that will be sent to XecGuard.
-
-        On the request side the conversation comes from ``inputs['structured_messages']``,
-        which litellm builds for every endpoint (chat, Anthropic ``system`` + ``messages``,
-        Responses ``instructions`` + ``input``) in the same OpenAI shape, system prompt
-        included. Only when it is absent (an older litellm, or a direct
-        ``/apply_guardrail`` call) does this fall back to ``request_data['messages']``,
-        which exists only for bodies that are already chat-shaped. Synthesises a trailing
-        user/assistant message when the data is incomplete.
-        """
-        raw_messages: Final = self._conversation_source(request_data, inputs, input_type)
-        messages: Final[list[dict]] = [self._normalize_message(m) for m in raw_messages if isinstance(m, dict)]
-
-        if input_type == "request":
-            if not messages:
-                return []
-            if messages[-1].get("role") != "user":
-                synthesized: Final = self._synthesize_user_from_inputs(inputs)
-                if synthesized is None:
-                    return []
-                messages.append(synthesized)
-            return messages
-
-        # input_type == "response"
-        assistant_text: Final = self._extract_assistant_text_from_response(request_data.get("response"))
-        resolved_text: Final = assistant_text if assistant_text is not None else self._join_input_texts(inputs)
-        if not resolved_text:
-            return []
-        messages.append({"role": "assistant", "content": resolved_text})
-        return messages
 
     @staticmethod
     def _join_input_texts(inputs: Any) -> str | None:
@@ -1470,7 +1440,7 @@ class XecGuardGuardrail(CustomGuardrail):
         return joined or None
 
     @staticmethod
-    def _normalize_message(message: dict) -> dict:
+    def _normalize_message(message: Mapping[str, object]) -> dict:
         """Flatten multimodal content to a plain string for XecGuard."""
         role: Final = message.get("role") or "user"
         content: Final = message.get("content")
@@ -1487,18 +1457,6 @@ class XecGuardGuardrail(CustomGuardrail):
         return {"role": role, "content": ""}
 
     @staticmethod
-    def _synthesize_user_from_inputs(inputs: Any) -> dict | None:
-        if not isinstance(inputs, dict):
-            return None
-        texts: Final = inputs.get("texts")
-        if not texts:
-            return None
-        joined: Final = "\n".join(t for t in texts if isinstance(t, str) and t)
-        if not joined:
-            return None
-        return {"role": "user", "content": joined}
-
-    @staticmethod
     def _extract_last_text_by_role(messages: list[dict], role: str) -> str | None:
         for message in reversed(messages):
             if message.get("role") == role:
@@ -1506,55 +1464,6 @@ class XecGuardGuardrail(CustomGuardrail):
                 if isinstance(content, str) and content:
                     return content
                 return None
-        return None
-
-    @staticmethod
-    def _extract_assistant_text_from_response(response: Any) -> str | None:
-        if response is None:
-            return None
-        choices = None
-        if hasattr(response, "choices"):
-            choices = response.choices
-        elif isinstance(response, dict):
-            choices = response.get("choices")
-        if not choices:
-            return None
-        text_parts: Final[list[str]] = []
-        for choice in choices:
-            content = XecGuardGuardrail._extract_choice_content(choice)
-            text = XecGuardGuardrail._content_to_text(content)
-            if text:
-                text_parts.append(text)
-        return "\n".join(text_parts) or None
-
-    @staticmethod
-    def _extract_choice_content(choice: Any) -> Any:
-        if hasattr(choice, "message"):
-            message = choice.message
-        elif isinstance(choice, dict):
-            message = choice.get("message")
-        else:
-            return None
-        if message is None:
-            return None
-        if hasattr(message, "content"):
-            return message.content
-        if isinstance(message, dict):
-            return message.get("content")
-        return None
-
-    @staticmethod
-    def _content_to_text(content: Any) -> str | None:
-        if isinstance(content, str) and content:
-            return content
-        if isinstance(content, list):
-            parts: Final = [
-                item.get("text")
-                for item in content
-                if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str)
-            ]
-            joined: Final = "\n".join(p for p in parts if p)
-            return joined or None
         return None
 
     # ------------------------------------------------------------------

@@ -839,7 +839,7 @@ class TestXecGuardGrounding:
             side_effect=[scan_ok, grounding_ok],
         ) as mock_post:
             await xecguard_guardrail.apply_guardrail(
-                inputs={"texts": []},
+                inputs={"texts": ["a"]},
                 request_data=request_data,
                 input_type="response",
             )
@@ -859,7 +859,7 @@ class TestXecGuardGrounding:
             xecguard_guardrail.async_handler, "post", return_value=scan_ok
         ) as mock_post:
             await xecguard_guardrail.apply_guardrail(
-                inputs={"texts": []},
+                inputs={"texts": ["a"]},
                 request_data=request_data,
                 input_type="response",
             )
@@ -881,7 +881,7 @@ class TestXecGuardGrounding:
             xecguard_guardrail.async_handler, "post", return_value=scan_ok
         ) as mock_post:
             await xecguard_guardrail.apply_guardrail(
-                inputs={"texts": []},
+                inputs={"texts": ["answer"]},
                 request_data=mock_request_data,
                 input_type="response",
             )
@@ -904,7 +904,7 @@ class TestXecGuardGrounding:
             xecguard_guardrail.async_handler, "post", return_value=scan_ok
         ) as mock_post:
             await xecguard_guardrail.apply_guardrail(
-                inputs={"texts": []},
+                inputs={"texts": ["only assistant"]},
                 request_data=request_data,
                 input_type="response",
             )
@@ -1253,168 +1253,6 @@ class TestXecGuardMessageAssembly:
         sent = mock_post.call_args.kwargs["json"]
         assert sent["messages"] == [{"role": "user", "content": "real"}]
 
-    @pytest.mark.asyncio
-    async def test_assistant_text_extracted_from_dict_response(
-        self, xecguard_guardrail, mock_request_data
-    ):
-        mock_request_data["response"] = {
-            "choices": [{"message": {"content": "dict-style response"}}]
-        }
-        resp = _make_response({"decision": "SAFE"})
-        with patch.object(
-            xecguard_guardrail.async_handler, "post", return_value=resp
-        ) as mock_post:
-            await xecguard_guardrail.apply_guardrail(
-                inputs={"texts": []},
-                request_data=mock_request_data,
-                input_type="response",
-            )
-        sent = mock_post.call_args.kwargs["json"]
-        assert sent["messages"][-1] == {
-            "role": "assistant",
-            "content": "dict-style response",
-        }
-
-    @pytest.mark.asyncio
-    async def test_assistant_text_extracted_from_list_content(
-        self, xecguard_guardrail, mock_request_data
-    ):
-        msg = MagicMock()
-        msg.content = [
-            {"type": "text", "text": "partA"},
-            {"type": "text", "text": "partB"},
-        ]
-        choice = MagicMock()
-        choice.message = msg
-        resp_obj = MagicMock()
-        resp_obj.choices = [choice]
-        mock_request_data["response"] = resp_obj
-        resp = _make_response({"decision": "SAFE"})
-        with patch.object(
-            xecguard_guardrail.async_handler, "post", return_value=resp
-        ) as mock_post:
-            await xecguard_guardrail.apply_guardrail(
-                inputs={"texts": []},
-                request_data=mock_request_data,
-                input_type="response",
-            )
-        sent = mock_post.call_args.kwargs["json"]
-        assert sent["messages"][-1]["content"] == "partA\npartB"
-
-    def test_extract_assistant_text_response_none(self, xecguard_guardrail):
-        assert xecguard_guardrail._extract_assistant_text_from_response(None) is None
-
-    def test_extract_assistant_text_no_choices(self, xecguard_guardrail):
-        assert xecguard_guardrail._extract_assistant_text_from_response({}) is None
-
-    def test_extract_assistant_text_empty_choices(self, xecguard_guardrail):
-        assert (
-            xecguard_guardrail._extract_assistant_text_from_response({"choices": []})
-            is None
-        )
-
-    def test_extract_assistant_text_first_choice_unknown_type(self, xecguard_guardrail):
-        resp = MagicMock(spec=[])  # no 'choices'
-        assert xecguard_guardrail._extract_assistant_text_from_response(resp) is None
-
-    def test_extract_assistant_text_first_choice_scalar(self, xecguard_guardrail):
-        assert (
-            xecguard_guardrail._extract_assistant_text_from_response({"choices": [42]})
-            is None
-        )
-
-    def test_extract_assistant_text_message_none(self, xecguard_guardrail):
-        assert (
-            xecguard_guardrail._extract_assistant_text_from_response(
-                {"choices": [{"message": None}]}
-            )
-            is None
-        )
-
-    def test_extract_assistant_text_message_scalar(self, xecguard_guardrail):
-        assert (
-            xecguard_guardrail._extract_assistant_text_from_response(
-                {"choices": [{"message": 42}]}
-            )
-            is None
-        )
-
-    def test_extract_assistant_text_content_none(self, xecguard_guardrail):
-        assert (
-            xecguard_guardrail._extract_assistant_text_from_response(
-                {"choices": [{"message": {"content": None}}]}
-            )
-            is None
-        )
-
-    def test_extract_assistant_text_content_empty_string(self, xecguard_guardrail):
-        assert (
-            xecguard_guardrail._extract_assistant_text_from_response(
-                {"choices": [{"message": {"content": ""}}]}
-            )
-            is None
-        )
-
-    def test_extract_assistant_text_content_list_all_images(self, xecguard_guardrail):
-        assert (
-            xecguard_guardrail._extract_assistant_text_from_response(
-                {
-                    "choices": [
-                        {"message": {"content": [{"type": "image_url", "url": "x"}]}}
-                    ]
-                }
-            )
-            is None
-        )
-
-    def test_extract_assistant_text_content_scalar(self, xecguard_guardrail):
-        assert (
-            xecguard_guardrail._extract_assistant_text_from_response(
-                {"choices": [{"message": {"content": 42}}]}
-            )
-            is None
-        )
-
-    def test_extract_assistant_text_combines_all_choices(self, xecguard_guardrail):
-        assert (
-            xecguard_guardrail._extract_assistant_text_from_response(
-                {
-                    "choices": [
-                        {"message": {"content": "first response"}},
-                        {
-                            "message": {
-                                "content": [
-                                    {"type": "text", "text": "second"},
-                                    {"type": "text", "text": "response"},
-                                ]
-                            }
-                        },
-                    ]
-                }
-            )
-            == "first response\nsecond\nresponse"
-        )
-
-    def test_synthesize_user_inputs_not_dict(self, xecguard_guardrail):
-        assert xecguard_guardrail._synthesize_user_from_inputs("not-dict") is None
-
-    def test_synthesize_user_no_texts(self, xecguard_guardrail):
-        assert xecguard_guardrail._synthesize_user_from_inputs({}) is None
-
-    def test_synthesize_user_texts_filtered_to_empty(self, xecguard_guardrail):
-        assert (
-            xecguard_guardrail._synthesize_user_from_inputs({"texts": [None, "", 42]})
-            is None
-        )
-
-    def test_synthesize_user_joins_strings(self, xecguard_guardrail):
-        assert xecguard_guardrail._synthesize_user_from_inputs(
-            {"texts": ["a", "b"]}
-        ) == {
-            "role": "user",
-            "content": "a\nb",
-        }
-
     def test_extract_last_text_by_role_not_found(self, xecguard_guardrail):
         assert (
             xecguard_guardrail._extract_last_text_by_role(
@@ -1529,7 +1367,7 @@ class TestXecGuardRequestPayload:
             xecguard_guardrail.async_handler, "post", return_value=resp
         ) as mock_post:
             await xecguard_guardrail.apply_guardrail(
-                inputs={"texts": []},
+                inputs={"texts": ["answer"]},
                 request_data=mock_request_data,
                 input_type="response",
             )
@@ -1593,7 +1431,7 @@ class TestXecGuardRequestPayload:
             side_effect=[scan_ok, grounding_ok],
         ) as mock_post:
             await xecguard_guardrail.apply_guardrail(
-                inputs={"texts": []},
+                inputs={"texts": ["answer"]},
                 request_data=mock_request_data,
                 input_type="response",
             )
@@ -1616,7 +1454,7 @@ class TestXecGuardRequestPayload:
             side_effect=[scan_ok, grounding_ok],
         ) as mock_post:
             await xecguard_guardrail.apply_guardrail(
-                inputs={"texts": []},
+                inputs={"texts": ["response text"]},
                 request_data=mock_request_data,
                 input_type="response",
             )
@@ -1730,7 +1568,7 @@ class TestXecGuardErrorHandling:
         ):
             with pytest.raises(HTTPException):
                 await xecguard_guardrail.apply_guardrail(
-                    inputs={"texts": []},
+                    inputs={"texts": ["answer"]},
                     request_data=mock_request_data,
                     input_type="response",
                 )
@@ -1760,11 +1598,11 @@ class TestXecGuardErrorHandling:
             ],
         ):
             result = await guardrail.apply_guardrail(
-                inputs={"texts": []},
+                inputs={"texts": ["answer"]},
                 request_data=mock_request_data,
                 input_type="response",
             )
-            assert result == {"texts": []}
+            assert result == {"texts": ["answer"]}
 
     @pytest.mark.asyncio
     async def test_unknown_decision_treated_as_safe(
@@ -4026,6 +3864,11 @@ FULL_CONVERSATION = [
 ]
 
 
+def _on_route(route: str, body: dict) -> dict:
+    """A request body as the proxy hands it to the guardrail: with the route it came in on."""
+    return {"model": "m", **body, "metadata": {"user_api_key_request_route": route}}
+
+
 async def _sent_messages(gr, request_data, inputs, input_type="request"):
     resp = _make_response({"decision": "SAFE"})
     with patch.object(gr.async_handler, "post", return_value=resp) as mock_post:
@@ -4172,20 +4015,22 @@ class TestXecGuardResponseScanHistory:
 
     @pytest.mark.asyncio
     async def test_responses_api_reply_is_scanned_after_its_instructions_and_input(self):
-        body = {"instructions": SYSTEM_PROMPT, "input": USER_PROMPT, "response": RESPONSES_OUTPUT}
+        body = _on_route("/v1/responses", {"instructions": SYSTEM_PROMPT, "input": USER_PROMPT})
         sent = await _sent_messages(_extension_guardrail(), body, {"texts": ["OK"]}, "response")
         assert sent == [*FULL_CONVERSATION, self.ASSISTANT]
 
     @pytest.mark.asyncio
     async def test_responses_api_input_items_are_flattened_into_turns(self):
-        body = {
-            "input": [
-                {"role": "user", "content": [{"type": "input_text", "text": "a"}, {"type": "input_text", "text": "b"}]},
-                {"role": "assistant", "content": "earlier"},
-                {"role": "user", "content": "last"},
-            ],
-            "response": RESPONSES_OUTPUT,
-        }
+        body = _on_route(
+            "/v1/responses",
+            {
+                "input": [
+                    {"role": "user", "content": [{"type": "input_text", "text": "a"}, {"type": "input_text", "text": "b"}]},
+                    {"role": "assistant", "content": "earlier"},
+                    {"role": "user", "content": "last"},
+                ]
+            },
+        )
         sent = await _sent_messages(_extension_guardrail(), body, {"texts": ["OK"]}, "response")
         assert sent == [
             {"role": "user", "content": "a\nb"},
@@ -4196,21 +4041,16 @@ class TestXecGuardResponseScanHistory:
 
     @pytest.mark.asyncio
     async def test_anthropic_reply_keeps_the_top_level_system_prompt(self):
-        body = {
-            "system": SYSTEM_PROMPT,
-            "messages": [{"role": "user", "content": USER_PROMPT}],
-            "response": {"content": [{"type": "text", "text": "OK"}], "role": "assistant"},
-        }
+        body = _on_route("/v1/messages", {"system": SYSTEM_PROMPT, "messages": [{"role": "user", "content": USER_PROMPT}]})
         sent = await _sent_messages(_extension_guardrail(), body, {"texts": ["OK"]}, "response")
         assert sent == [*FULL_CONVERSATION, self.ASSISTANT]
 
     @pytest.mark.asyncio
     async def test_anthropic_system_given_as_content_blocks_is_flattened(self):
-        body = {
-            "system": [{"type": "text", "text": "S1"}, {"type": "text", "text": "S2"}],
-            "messages": [{"role": "user", "content": "q"}],
-            "response": {"content": [{"type": "text", "text": "OK"}]},
-        }
+        body = _on_route(
+            "/v1/messages",
+            {"system": [{"type": "text", "text": "S1"}, {"type": "text", "text": "S2"}], "messages": [{"role": "user", "content": "q"}]},
+        )
         sent = await _sent_messages(_extension_guardrail(), body, {"texts": ["OK"]}, "response")
         assert sent[0] == {"role": "system", "content": "S1\nS2"}
 
@@ -4227,32 +4067,9 @@ class TestXecGuardResponseScanHistory:
         assert [m["role"] for m in sent] == ["system", "user", "assistant"]
 
     @pytest.mark.asyncio
-    async def test_reply_text_falls_back_to_inputs_texts_when_the_response_has_no_choices(self):
-        body = {"input": USER_PROMPT, "response": RESPONSES_OUTPUT}
-        sent = await _sent_messages(_extension_guardrail(), body, {"texts": ["from texts"]}, "response")
-        assert sent == [{"role": "user", "content": USER_PROMPT}, {"role": "assistant", "content": "from texts"}]
-
-    @pytest.mark.asyncio
     async def test_a_body_with_no_recognised_input_still_sends_only_the_reply(self):
         # e.g. Gemini contents: nothing to rebuild the request from, behaviour is unchanged
         sent = await _sent_messages(_extension_guardrail(), {"contents": []}, {"texts": ["OK"]}, "response")
-        assert sent == [self.ASSISTANT]
-
-    @pytest.mark.asyncio
-    async def test_an_unparseable_responses_input_does_not_break_the_scan(self):
-        body = {"input": 123, "response": RESPONSES_OUTPUT}
-        sent = await _sent_messages(_extension_guardrail(), body, {"texts": ["OK"]}, "response")
-        assert sent == [self.ASSISTANT]
-
-    @pytest.mark.asyncio
-    async def test_a_failing_litellm_transformation_falls_back_to_the_reply_alone(self):
-        body = {"input": USER_PROMPT, "response": RESPONSES_OUTPUT}
-        target = (
-            "litellm.responses.litellm_completion_transformation.transformation."
-            "LiteLLMCompletionResponsesConfig.transform_responses_api_input_to_messages"
-        )
-        with patch(target, side_effect=RuntimeError("shape litellm no longer supports")):
-            sent = await _sent_messages(_extension_guardrail(), body, {"texts": ["OK"]}, "response")
         assert sent == [self.ASSISTANT]
 
     @pytest.mark.asyncio
@@ -4314,28 +4131,6 @@ async def _drain(gen) -> list:
 
 def _block_text(blocks: list) -> str:
     return b"".join(b if isinstance(b, bytes) else b.encode() for b in blocks).decode()
-
-
-@pytest.mark.usefixtures("_clean_env")
-class TestXecGuardStreamChunkText:
-    def test_chat_chunk_text_is_read_from_the_delta(self):
-        assert XecGuardGuardrail._chunk_delta_text(_stream_chunk("hi")) == "hi"
-
-    def test_responses_text_delta_event_text_is_read_from_delta(self):
-        assert XecGuardGuardrail._chunk_delta_text(_responses_delta("你好")) == "你好"
-
-    def test_responses_lifecycle_events_carry_no_text(self):
-        assert XecGuardGuardrail._chunk_delta_text(_created_event()) == ""
-
-    def test_a_responses_dict_event_is_read_too(self):
-        assert XecGuardGuardrail._chunk_delta_text({"type": "response.output_text.delta", "delta": "x"}) == "x"
-
-    def test_a_text_done_event_is_not_counted_twice(self):
-        done = {"type": "response.output_text.done", "text": "whole text"}
-        assert XecGuardGuardrail._chunk_delta_text(done) == ""
-
-    def test_an_unknown_object_yields_no_text(self):
-        assert XecGuardGuardrail._chunk_delta_text(object()) == ""
 
 
 @pytest.mark.usefixtures("_clean_env")
@@ -4783,53 +4578,35 @@ def _gemini_sse(*texts: str) -> bytes:
     return f"data: {json.dumps({'candidates': [{'content': {'role': 'model', 'parts': parts}}]})}\r\n\r\n".encode()
 
 
-def _read_all(chunks) -> list[str]:
-    read = XecGuardGuardrail._stream_text_reader()
-    return [read(c) for c in chunks]
-
-
 async def _byte_stream(chunks):
     for chunk in chunks:
         yield chunk
 
 
+
+ANTHROPIC_BODY = {"model": "m", "system": SYSTEM_PROMPT, "messages": [{"role": "user", "content": USER_PROMPT}]}
+
+
+def _anthropic_message_stream(texts: list[str]) -> list[bytes]:
+    return [
+        _anthropic_sse(
+            "message_start",
+            {"type": "message_start", "message": {"id": "m", "type": "message", "role": "assistant", "content": []}},
+        ),
+        *(_anthropic_text(t) for t in texts),
+        _anthropic_sse("message_stop", {"type": "message_stop"}),
+    ]
+
+
 @pytest.mark.usefixtures("_clean_env")
-class TestXecGuardRawSseStreamText:
-    def test_anthropic_text_deltas_are_read(self):
-        assert _read_all([_anthropic_text("A123"), _anthropic_text("456")]) == ["A123", "456"]
-
-    def test_anthropic_events_without_text_are_skipped(self):
-        chunks = [
-            _anthropic_sse("message_start", {"type": "message_start", "message": {"content": []}}),
-            _anthropic_sse("ping", {"type": "ping"}),
-            _anthropic_sse(
-                "content_block_delta",
-                {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{"}},
-            ),
-            _anthropic_sse("message_stop", {"type": "message_stop"}),
-        ]
-        assert _read_all(chunks) == ["", "", "", ""]
-
-    def test_one_chunk_carrying_several_events_yields_all_their_text(self):
-        assert _read_all([_anthropic_text("ab") + _anthropic_text("cd")]) == ["abcd"]
-
-    def test_an_event_split_across_chunks_is_read_once_it_completes(self):
-        whole = _anthropic_text("王小明")
-        cut = len(whole) - 30
-        assert _read_all([whole[:cut], whole[cut:]]) == ["", "王小明"]
-
-    def test_gemini_part_texts_are_read(self):
-        assert _read_all([_gemini_sse("A12", "34"), _gemini_sse("56")]) == ["A1234", "56"]
-
-    def test_gemini_done_marker_and_non_json_data_are_ignored(self):
-        assert _read_all([b"data: [DONE]\n\n", b"data: not-json\n\n", b": keepalive\n\n"]) == ["", "", ""]
-
-    def test_object_chunks_are_still_read_directly(self):
-        assert _read_all([_stream_chunk("hi")]) == ["hi"]
+class TestXecGuardReadsThroughLitellmTranslation:
+    """Every route is read through litellm's own translation for it, so XecGuard parses
+    no endpoint format itself: the request conversation comes from the translation's
+    ``get_structured_messages`` and the reply text from what it hands ``apply_guardrail``."""
 
     @pytest.mark.asyncio
-    async def test_a_gemini_window_scan_sees_the_streamed_text(self):
-        gr = _stream_guardrail()
+    async def test_a_gemini_stream_window_scans_the_streamed_text(self):
+        gr = _stream_guardrail(stream_chunk=2, stream_context=0)
         scan = AsyncMock(return_value={"decision": "SAFE"})
         with patch.object(gr, "_call_scan", new=scan):
             out = await _drain(
@@ -4840,19 +4617,94 @@ class TestXecGuardRawSseStreamText:
                 )
             )
         assert len(out) == 4
-        assert [c.kwargs["messages"][-1]["content"] for c in scan.call_args_list] == ["A12345", "3456789 ok"]
+        assert [c.kwargs["messages"][-1]["content"] for c in scan.call_args_list] == ["A12345", "6789 ok"]
 
     @pytest.mark.asyncio
-    async def test_a_buffered_anthropic_stream_is_scanned_on_its_text(self):
-        gr = _stream_guardrail(stream_mode="buffer")
+    async def test_an_anthropic_stream_window_carries_the_request_and_the_text(self):
+        gr = _stream_guardrail(stream_chunk=2, stream_context=1)
         scan = AsyncMock(return_value={"decision": "SAFE"})
-        whole = _anthropic_text("A123456789")
         with patch.object(gr, "_call_scan", new=scan):
             await _drain(
                 gr.async_post_call_streaming_iterator_hook(
                     user_api_key_dict=_route_user("/v1/messages"),
-                    response=_byte_stream([whole[:40], whole[40:], _anthropic_text(" end")]),
+                    response=_byte_stream(_anthropic_message_stream(["ab", "cd", "ef"])),
+                    request_data=dict(ANTHROPIC_BODY),
+                )
+            )
+        # events: start, ab | cd, ef | stop  -> windows read 2 events at a time, each
+        # reaching back over the text of the `stream_context` (1) event before it
+        windows = [c.kwargs["messages"][-1]["content"] for c in scan.call_args_list]
+        assert windows == ["ab", "abcdef"]
+        for call in scan.call_args_list:
+            assert call.kwargs["messages"][:-1] == FULL_CONVERSATION
+
+    @pytest.mark.asyncio
+    async def test_a_buffered_anthropic_stream_is_scanned_as_one_reply_after_its_request(self):
+        gr = _stream_guardrail(stream_mode="buffer")
+        scan = AsyncMock(return_value={"decision": "SAFE"})
+        events = _anthropic_message_stream(["A123", "456789"])
+        with patch.object(gr, "_call_scan", new=scan):
+            out = await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=_route_user("/v1/messages"),
+                    response=_byte_stream(events),
+                    request_data=dict(ANTHROPIC_BODY),
+                )
+            )
+        assert out == events
+        assert scan.call_args.kwargs["messages"] == [
+            *FULL_CONVERSATION,
+            {"role": "assistant", "content": "A123456789"},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_the_chunks_the_client_receives_are_not_rewritten_by_the_read(self):
+        gr = _stream_guardrail(stream_chunk=2, stream_context=0)
+        with patch.object(gr, "_call_scan", new=AsyncMock(return_value={"decision": "SAFE"})):
+            out = await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=_route_user("/v1/chat/completions"),
+                    response=_fake_stream(["a", "b", "c"]),
                     request_data=_meta_request_data(),
                 )
             )
-        assert scan.call_args.kwargs["messages"][-1]["content"] == "A123456789 end"
+        assert [c.choices[0].delta.content for c in out] == ["a", "b", "c"]
+
+    @pytest.mark.asyncio
+    async def test_a_route_with_no_translation_scans_no_text(self):
+        gr = _stream_guardrail()
+        scan = AsyncMock(return_value=UNSAFE_SCAN)
+        with patch.object(gr, "_call_scan", new=scan):
+            out = await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=_route_user("/not/a/known/route"),
+                    response=_byte_stream([b"data: x\n\n", b"data: y\n\n"]),
+                    request_data=_meta_request_data(),
+                )
+            )
+        assert out == [b"data: x\n\n", b"data: y\n\n"]
+        scan.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_logging_only_scan_reads_an_anthropic_reply(self):
+        gr = _extension_guardrail(event_hook="logging_only")
+        kwargs = {
+            "model": "m",
+            "messages": [{"role": "user", "content": USER_PROMPT}],
+            "optional_params": {"system": SYSTEM_PROMPT},
+            "standard_logging_object": {},
+        }
+        result = {
+            "id": "msg",
+            "type": "message",
+            "role": "assistant",
+            "model": "m",
+            "content": [{"type": "text", "text": "OK"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }
+        scan = AsyncMock(return_value={"decision": "SAFE"})
+        with patch.object(gr, "_call_scan", new=scan):
+            await gr.async_logging_hook(kwargs=kwargs, result=result, call_type="anthropic_messages")
+        assert scan.call_args.kwargs["scan_type"] == "response"
+        assert scan.call_args.kwargs["messages"] == [*FULL_CONVERSATION, {"role": "assistant", "content": "OK"}]
