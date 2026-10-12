@@ -144,6 +144,7 @@ def _sanitize_scan_result_for_logging(scan_result: dict) -> dict:
 _DEFAULT_API_BASE: Final = "https://api-xecguard.cycraft.ai"
 _SCAN_ENDPOINT: Final = "/xecguard/v1/scan"
 _GROUNDING_ENDPOINT: Final = "/xecguard/v1/grounding"
+_NO_REQUEST_TEXT: Final = "(request text unavailable)"
 _DEFAULT_MODEL: Final = "xecguard_v2"
 _DEFAULT_CUSTOM_POLICY_MIN_CHARS: Final = 500
 _DEFAULT_GROUNDING_STRICTNESS: Final = "BALANCED"
@@ -1293,7 +1294,7 @@ class XecGuardGuardrail(CustomGuardrail):
     ) -> dict | None:
         prompt: Final = self._extract_last_text_by_role(messages, "user")
         response_text: Final = self._extract_last_text_by_role(messages, "assistant")
-        if prompt is None or response_text is None:
+        if prompt is None or prompt == _NO_REQUEST_TEXT or response_text is None:
             return None
         payload: Final = {
             "model": self.xecguard_model,
@@ -1439,7 +1440,19 @@ class XecGuardGuardrail(CustomGuardrail):
         )
         texts: Final = self._join_input_texts(inputs)
         if input_type == "response":
-            return [*turns, {"role": "assistant", "content": texts}] if texts else []
+            if not texts:
+                return []
+            lead = (
+                turns
+                if any(t.get("role") == "user" and t.get("content") for t in turns)
+                else [
+                    *turns,
+                    {"role": "user", "content": _NO_REQUEST_TEXT},
+                ]
+            )
+            return [*lead, {"role": "assistant", "content": texts}]
+        if not turns and texts:
+            return [{"role": "user", "content": texts}]
         if not turns or turns[-1].get("role") == "user":
             return turns
         return [*turns, {"role": "user", "content": texts}] if texts else []

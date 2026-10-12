@@ -3921,8 +3921,15 @@ class TestXecGuardStructuredMessages:
         assert sent == FULL_CONVERSATION
 
     @pytest.mark.asyncio
-    async def test_neither_source_present_sends_no_scan(self):
+    async def test_no_conversation_scans_extracted_texts_as_user_turn(self):
+        # Routes whose translation has no role-tagged conversation (Gemini generateContent)
+        # still get scanned, using the text litellm extracted.
         sent = await _sent_messages(_extension_guardrail(), {"input": "x"}, {"texts": ["x"]})
+        assert sent == [{"role": "user", "content": "x"}]
+
+    @pytest.mark.asyncio
+    async def test_no_conversation_and_no_texts_sends_no_scan(self):
+        sent = await _sent_messages(_extension_guardrail(), {"input": "x"}, {"texts": []})
         assert sent is None
 
     @pytest.mark.asyncio
@@ -4068,9 +4075,14 @@ class TestXecGuardResponseScanHistory:
 
     @pytest.mark.asyncio
     async def test_a_body_with_no_recognised_input_still_sends_only_the_reply(self):
-        # e.g. Gemini contents: nothing to rebuild the request from, behaviour is unchanged
         sent = await _sent_messages(_extension_guardrail(), {"contents": []}, {"texts": ["OK"]}, "response")
-        assert sent == [self.ASSISTANT]
+        assert sent == [{"role": "user", "content": "(request text unavailable)"}, self.ASSISTANT]
+
+    @pytest.mark.asyncio
+    async def test_a_reply_with_a_real_user_turn_gets_no_placeholder(self):
+        body = {"messages": [{"role": "user", "content": "hi"}]}
+        sent = await _sent_messages(_extension_guardrail(), body, {"texts": ["OK"]}, "response")
+        assert sent == [{"role": "user", "content": "hi"}, self.ASSISTANT]
 
     @pytest.mark.asyncio
     async def test_a_reply_with_no_text_is_not_scanned(self):
