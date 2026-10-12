@@ -4765,3 +4765,94 @@ class TestXecGuardRecordedEventType:
     )
     async def test_the_recorded_mode_is_the_hook_the_scan_ran_under(self, event_hook, input_type, mcp, expected):
         assert await self._record(event_hook, input_type, mcp) == expected
+
+
+def _anthropic_sse(event: str, payload: dict) -> bytes:
+    return f"event: {event}\ndata: {json.dumps(payload)}\n\n".encode()
+
+
+def _anthropic_text(text: str) -> bytes:
+    return _anthropic_sse(
+        "content_block_delta",
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}},
+    )
+
+
+def _gemini_sse(*texts: str) -> bytes:
+    parts = [{"text": t} for t in texts]
+    return f"data: {json.dumps({'candidates': [{'content': {'role': 'model', 'parts': parts}}]})}\r\n\r\n".encode()
+
+
+def _read_all(chunks) -> list[str]:
+    read = XecGuardGuardrail._stream_text_reader()
+    return [read(c) for c in chunks]
+
+
+async def _byte_stream(chunks):
+    for chunk in chunks:
+        yield chunk
+
+
+@pytest.mark.usefixtures("_clean_env")
+class TestXecGuardRawSseStreamText:
+    def test_anthropic_text_deltas_are_read(self):
+        assert _read_all([_anthropic_text("A123"), _anthropic_text("456")]) == ["A123", "456"]
+
+    def test_anthropic_events_without_text_are_skipped(self):
+        chunks = [
+            _anthropic_sse("message_start", {"type": "message_start", "message": {"content": []}}),
+            _anthropic_sse("ping", {"type": "ping"}),
+            _anthropic_sse(
+                "content_block_delta",
+                {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{"}},
+            ),
+            _anthropic_sse("message_stop", {"type": "message_stop"}),
+        ]
+        assert _read_all(chunks) == ["", "", "", ""]
+
+    def test_one_chunk_carrying_several_events_yields_all_their_text(self):
+        assert _read_all([_anthropic_text("ab") + _anthropic_text("cd")]) == ["abcd"]
+
+    def test_an_event_split_across_chunks_is_read_once_it_completes(self):
+        whole = _anthropic_text("王小明")
+        cut = len(whole) - 30
+        assert _read_all([whole[:cut], whole[cut:]]) == ["", "王小明"]
+
+    def test_gemini_part_texts_are_read(self):
+        assert _read_all([_gemini_sse("A12", "34"), _gemini_sse("56")]) == ["A1234", "56"]
+
+    def test_gemini_done_marker_and_non_json_data_are_ignored(self):
+        assert _read_all([b"data: [DONE]\n\n", b"data: not-json\n\n", b": keepalive\n\n"]) == ["", "", ""]
+
+    def test_object_chunks_are_still_read_directly(self):
+        assert _read_all([_stream_chunk("hi")]) == ["hi"]
+
+    @pytest.mark.asyncio
+    async def test_a_gemini_window_scan_sees_the_streamed_text(self):
+        gr = _stream_guardrail()
+        scan = AsyncMock(return_value={"decision": "SAFE"})
+        with patch.object(gr, "_call_scan", new=scan):
+            out = await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=_route_user("/v1beta/models/{model}:streamGenerateContent"),
+                    response=_byte_stream([_gemini_sse(t) for t in ["A12", "345", "6789", " ok"]]),
+                    request_data=_meta_request_data(),
+                )
+            )
+        assert len(out) == 4
+        assert [c.kwargs["messages"][-1]["content"] for c in scan.call_args_list] == ["A12345", "3456789 ok"]
+
+    @pytest.mark.asyncio
+    async def test_a_buffered_anthropic_stream_is_scanned_on_its_text(self):
+        gr = _stream_guardrail(stream_mode="buffer")
+        scan = AsyncMock(return_value={"decision": "SAFE"})
+        whole = _anthropic_text("A123456789")
+        with patch.object(gr, "_call_scan", new=scan):
+            await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=_route_user("/v1/messages"),
+                    response=_byte_stream([whole[:40], whole[40:], _anthropic_text(" end")]),
+                    request_data=_meta_request_data(),
+                )
+            )
+        assert scan.call_args.kwargs["messages"][-1]["content"] == "A123456789 end"

@@ -37,7 +37,7 @@ import asyncio
 import json
 import os
 import re
-from collections.abc import AsyncGenerator, Mapping, Sequence
+from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from datetime import datetime
 from functools import reduce
 from typing import TYPE_CHECKING, Any, Final, Literal, Optional, cast
@@ -751,9 +751,25 @@ class XecGuardGuardrail(CustomGuardrail):
         """Text carried by one streamed event, whatever route produced it.
 
         Chat chunks keep it in ``choices[0].delta.content``; Responses spends it
-        in ``response.output_text.delta`` events (``delta``). Every other event
-        (lifecycle, ``.done`` repeats of text already streamed) carries none.
+        in ``response.output_text.delta`` events (``delta``); an SSE event decoded
+        from a raw byte stream is the parsed ``data:`` JSON - Anthropic's
+        ``content_block_delta`` / ``text_delta`` or Gemini's ``candidates[].content.parts[].text``.
+        Every other event (lifecycle, ``.done`` repeats of text already streamed) carries none.
         """
+        if isinstance(chunk, dict) and chunk.get("type") == "content_block_delta":
+            text_delta: Final = chunk.get("delta")
+            if not isinstance(text_delta, dict) or text_delta.get("type") != "text_delta":
+                return ""
+            text: Final = text_delta.get("text")
+            return text if isinstance(text, str) else ""
+        if isinstance(chunk, dict) and isinstance(candidates := chunk.get("candidates"), list):
+            return "".join(
+                part["text"]
+                for candidate in candidates
+                if isinstance(candidate, dict) and isinstance(content := candidate.get("content"), dict)
+                for part in content.get("parts") or ()
+                if isinstance(part, dict) and isinstance(part.get("text"), str)
+            )
         event_type: Final = chunk.get("type") if isinstance(chunk, dict) else getattr(chunk, "type", None)
         if event_type == "response.output_text.delta":
             delta: Final = chunk.get("delta") if isinstance(chunk, dict) else getattr(chunk, "delta", None)
@@ -764,6 +780,35 @@ class XecGuardGuardrail(CustomGuardrail):
         choice_delta: Final = getattr(choices[0], "delta", None)
         content: Final = getattr(choice_delta, "content", None) if choice_delta is not None else None
         return content if isinstance(content, str) else ""
+
+    @classmethod
+    def _stream_text_reader(cls) -> "Callable[[Any], str]":
+        """Per-stream text reader. Object chunks are read directly; raw SSE bytes
+        (``/v1/messages``, Gemini ``streamGenerateContent``) are split on transport
+        boundaries, not event boundaries, so they are carried until a blank line
+        completes an event and only then parsed."""
+        pending: Final[list[str]] = [""]  # mutable-ok: the unterminated SSE tail carried between chunks
+
+        def read(chunk: Any) -> str:
+            if not isinstance(chunk, (bytes, bytearray, str)):
+                return cls._chunk_delta_text(chunk)
+            raw: Final = chunk if isinstance(chunk, str) else bytes(chunk).decode("utf-8", errors="replace")
+            *events, tail = (pending[0] + raw.replace("\r\n", "\n")).split("\n\n")
+            pending[0] = tail
+            return "".join(cls._sse_event_text(event) for event in events)
+
+        return read
+
+    @classmethod
+    def _sse_event_text(cls, event: str) -> str:
+        data: Final = "\n".join(line[5:].strip() for line in event.split("\n") if line.startswith("data:"))
+        if not data or data == "[DONE]":
+            return ""
+        try:
+            parsed: Final[object] = json.loads(data)
+        except json.JSONDecodeError:
+            return ""
+        return cls._chunk_delta_text(parsed) if isinstance(parsed, dict) else ""
 
     def _block_events(
         self,
@@ -839,6 +884,7 @@ class XecGuardGuardrail(CustomGuardrail):
         audit_only: bool,
     ) -> AsyncGenerator[Any, None]:
         base_messages: Final = self._request_messages_for_stream(request_data)
+        read_text: Final = self._stream_text_reader()
         pieces: Final[list[str]] = []
         held: Final[list[Any]] = []
         released: Final[list[Any]] = []
@@ -855,7 +901,7 @@ class XecGuardGuardrail(CustomGuardrail):
             return result
 
         async for chunk in response:
-            pieces.append(self._chunk_delta_text(chunk))
+            pieces.append(read_text(chunk))
             if self.stream_first:
                 released.append(chunk)
                 yield chunk
@@ -921,7 +967,8 @@ class XecGuardGuardrail(CustomGuardrail):
         async for chunk in response:
             all_chunks.append(chunk)
 
-        text: Final = "".join(self._chunk_delta_text(chunk) for chunk in all_chunks)
+        read_text: Final = self._stream_text_reader()
+        text: Final = "".join(read_text(chunk) for chunk in all_chunks)
         if text:
             xg_messages: Final = [
                 *self._request_messages_for_stream(request_data),
