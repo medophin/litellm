@@ -40,7 +40,7 @@ import re
 from collections.abc import AsyncGenerator, Mapping, Sequence
 from datetime import datetime
 from functools import reduce
-from typing import TYPE_CHECKING, Any, Final, Literal, Optional
+from typing import TYPE_CHECKING, Any, Final, Literal, Optional, cast
 
 from fastapi.exceptions import HTTPException
 
@@ -503,21 +503,9 @@ class XecGuardGuardrail(CustomGuardrail):
         if scan_result is None:
             return inputs
 
+        event_type: Final = self._scan_event_type(request_data, input_type)
         if scan_result.get("decision") == "UNSAFE":
-            self._record_scan_outcome(
-                request_data=request_data,
-                scan_result=scan_result,
-                input_type=input_type,
-                guardrail_status="guardrail_intervened",
-                tracing_detail=GuardrailTracingDetail(
-                    guardrail_action="BLOCKED",
-                    violation_categories=list(self._violated_policy_names(scan_result)),
-                ),
-            )
-            verbose_proxy_logger.info(
-                "XecGuard blocked: %s",
-                json.dumps(self._request_context(request_data, scan_result), ensure_ascii=False, default=str),
-            )
+            self._record_block(request_data, scan_result, event_type)
             raise HTTPException(
                 status_code=400,
                 detail={
@@ -535,6 +523,7 @@ class XecGuardGuardrail(CustomGuardrail):
                     documents=documents,
                 )
                 if grounding_result is not None and grounding_result.get("decision") == "UNSAFE":
+                    self._record_block(request_data, grounding_result, event_type)
                     raise HTTPException(
                         status_code=400,
                         detail={
@@ -547,11 +536,57 @@ class XecGuardGuardrail(CustomGuardrail):
         self._record_scan_outcome(
             request_data=request_data,
             scan_result=scan_result,
-            input_type=input_type,
+            event_type=event_type,
             guardrail_status="success",
             tracing_detail=GuardrailTracingDetail(guardrail_action="ALLOWED"),
         )
         return inputs
+
+    def _scan_event_type(self, request_data: Mapping[str, object], input_type: str) -> GuardrailEventHooks:
+        """The hook this scan ran under. ``apply_guardrail`` is reached from pre_call and
+        during_call alike with no signal of which, so the configured mode decides."""
+        is_mcp: Final = isinstance(request_data.get("mcp_tool_call_metadata"), Mapping)
+        if input_type == "response":
+            return GuardrailEventHooks.post_mcp_call if is_mcp else GuardrailEventHooks.post_call
+        configured: Final[Sequence[object]] = (
+            self.event_hook
+            if isinstance(self.event_hook, list)
+            else ()
+            if self.event_hook is None
+            else (self.event_hook,)
+        )
+        hooks: Final = frozenset(str(h) for h in configured)
+        if is_mcp:
+            only_during: Final = "during_mcp_call" in hooks and "pre_mcp_call" not in hooks
+            return GuardrailEventHooks.during_mcp_call if only_during else GuardrailEventHooks.pre_mcp_call
+        return (
+            GuardrailEventHooks.during_call
+            if "during_call" in hooks and "pre_call" not in hooks
+            else GuardrailEventHooks.pre_call
+        )
+
+    def _record_block(
+        self,
+        request_data: dict,
+        result: dict,
+        event_type: GuardrailEventHooks,
+        action: Literal["BLOCKED", "FLAGGED"] = "BLOCKED",
+    ) -> None:
+        self._record_scan_outcome(
+            request_data=request_data,
+            scan_result=result,
+            event_type=event_type,
+            guardrail_status="guardrail_intervened" if action == "BLOCKED" else "guardrail_flagged",
+            tracing_detail=GuardrailTracingDetail(
+                guardrail_action=action,
+                violation_categories=list(self._violated_policy_names(result)),
+            ),
+        )
+        verbose_proxy_logger.info(
+            "XecGuard %s: %s",
+            action.lower(),
+            json.dumps(self._request_context(request_data, result), ensure_ascii=False, default=str),
+        )
 
     async def async_logging_hook(
         self,
@@ -694,6 +729,10 @@ class XecGuardGuardrail(CustomGuardrail):
         chunks, Responses events). A block is built by the route's litellm
         translation handler, so it ends the stream in that route's format.
         """
+        if not self._key_is_targeted(self._key_context(request_data)):
+            async for chunk in response:
+                yield chunk
+            return
         route: Final = getattr(user_api_key_dict, "request_route", None)
         if self.stream_mode == "buffer":
             async for chunk in self._buffer_all_and_scan(response=response, request_data=request_data, route=route):
@@ -780,6 +819,7 @@ class XecGuardGuardrail(CustomGuardrail):
         base_messages: list[dict],
         pieces: list[str],
         scanned: int,
+        request_data: dict,
     ) -> dict | None:
         new_pieces: Final = pieces[scanned:]
         if not new_pieces:
@@ -787,7 +827,9 @@ class XecGuardGuardrail(CustomGuardrail):
         overlap_start: Final = max(0, scanned - self.stream_context)
         window_text: Final = "".join(pieces[overlap_start:scanned]) + "".join(new_pieces)
         messages: Final = [*base_messages, {"role": "assistant", "content": window_text}]
-        return await self._call_scan(messages=messages, scan_type="response", suppress_errors=True)
+        return await self._call_scan(
+            messages=messages, scan_type="response", request_data=request_data, suppress_errors=True
+        )
 
     async def _window_scan_stream(
         self,
@@ -800,7 +842,17 @@ class XecGuardGuardrail(CustomGuardrail):
         pieces: Final[list[str]] = []
         held: Final[list[Any]] = []
         released: Final[list[Any]] = []
+        flagged: Final[list[dict]] = []  # mutable-ok: audit hits collected while the stream runs
+        last_result: dict | None = None
         scanned = 0
+
+        async def scan() -> dict | None:
+            result: Final = await self._scan_stream_window(
+                base_messages=base_messages, pieces=pieces, scanned=scanned, request_data=request_data
+            )
+            if result is not None and result.get("decision") == "UNSAFE" and audit_only:
+                flagged.append(result)
+            return result
 
         async for chunk in response:
             pieces.append(self._chunk_delta_text(chunk))
@@ -813,11 +865,13 @@ class XecGuardGuardrail(CustomGuardrail):
             if len(pieces) - scanned < self.stream_chunk:
                 continue
 
-            result = await self._scan_stream_window(base_messages=base_messages, pieces=pieces, scanned=scanned)
+            result = await scan()
             if result is not None and result.get("decision") == "UNSAFE" and not audit_only:
+                self._record_block(request_data, result, GuardrailEventHooks.post_call)
                 for event in self._block_events(result, request_data, route, released):
                     yield event
                 return
+            last_result = result or last_result
             scanned = len(pieces)
             if not self.stream_first:
                 for held_chunk in held:
@@ -825,14 +879,37 @@ class XecGuardGuardrail(CustomGuardrail):
                     yield held_chunk
                 held.clear()
 
-        result = await self._scan_stream_window(base_messages=base_messages, pieces=pieces, scanned=scanned)
+        result = await scan()
         if result is not None and result.get("decision") == "UNSAFE" and not audit_only:
+            self._record_block(request_data, result, GuardrailEventHooks.post_call)
             for event in self._block_events(result, request_data, route, released):
                 yield event
             return
+        self._record_stream_end(request_data, flagged, result or last_result)
         if not self.stream_first:
             for held_chunk in held:
                 yield held_chunk
+
+    def _record_stream_end(
+        self,
+        request_data: dict[str, object],
+        flagged: Sequence[dict[str, object]],
+        last_result: dict[str, object] | None,
+    ) -> None:
+        """A stream that reached its end unblocked: flagged when audit mode saw an UNSAFE
+        window, otherwise allowed - provided at least one scan actually came back."""
+        if flagged:
+            self._record_block(request_data, flagged[0], GuardrailEventHooks.post_call, action="FLAGGED")
+            return
+        if last_result is None:
+            return
+        self._record_scan_outcome(
+            request_data=request_data,
+            scan_result=last_result,
+            event_type=GuardrailEventHooks.post_call,
+            guardrail_status="success",
+            tracing_detail=GuardrailTracingDetail(guardrail_action="ALLOWED"),
+        )
 
     async def _buffer_all_and_scan(
         self,
@@ -846,12 +923,19 @@ class XecGuardGuardrail(CustomGuardrail):
 
         text: Final = "".join(self._chunk_delta_text(chunk) for chunk in all_chunks)
         if text:
-            xg_messages: Final = [*self._request_messages_for_stream(request_data), {"role": "assistant", "content": text}]
-            scan_result: Final = await self._call_scan(messages=xg_messages, scan_type="response")
+            xg_messages: Final = [
+                *self._request_messages_for_stream(request_data),
+                {"role": "assistant", "content": text},
+            ]
+            scan_result: Final = await self._call_scan(
+                messages=xg_messages, scan_type="response", request_data=request_data
+            )
             if scan_result is not None and scan_result.get("decision") == "UNSAFE":
+                self._record_block(request_data, scan_result, GuardrailEventHooks.post_call)
                 for event in self._block_events(scan_result, request_data, route, []):
                     yield event
                 return
+            self._record_stream_end(request_data, (), scan_result)
 
         for chunk in all_chunks:
             yield chunk
@@ -1221,9 +1305,7 @@ class XecGuardGuardrail(CustomGuardrail):
         call_message: Final = {
             "role": "assistant",
             "content": None,
-            "tool_calls": [
-                {"id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}}
-            ],
+            "tool_calls": [{"id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}}],
         }
         if input_type == "request":
             return (call_message,), "response"
@@ -1468,7 +1550,7 @@ class XecGuardGuardrail(CustomGuardrail):
         self,
         request_data: dict,
         scan_result: dict,
-        input_type: Literal["request", "response"],
+        event_type: GuardrailEventHooks,
         guardrail_status: GuardrailStatus,
         tracing_detail: GuardrailTracingDetail,
     ) -> None:
@@ -1479,7 +1561,7 @@ class XecGuardGuardrail(CustomGuardrail):
             },
             request_data=request_data,
             guardrail_status=guardrail_status,
-            event_type=GuardrailEventHooks.pre_call if input_type == "request" else GuardrailEventHooks.post_call,
+            event_type=event_type,
             tracing_detail=tracing_detail,
         )
 
@@ -1497,11 +1579,7 @@ class XecGuardGuardrail(CustomGuardrail):
             (m for k in ("metadata", "litellm_metadata") if isinstance(m := metadata.get(k), dict)),
             {},
         )
-        violations: Final = scan_result.get("xecguard_result")
-        rationale: Final = next(
-            (v["rationale"] for v in violations if isinstance(v, dict) and v.get("rationale")),
-            None,
-        ) if isinstance(violations, list) else None
+        rationale: Final = next((v["rationale"] for v in cls._violations(scan_result) if v.get("rationale")), None)
         return {
             "request_id": request_data.get("litellm_call_id"),
             "session_id": request_data.get("litellm_session_id") or md.get("session_id"),
@@ -1514,11 +1592,15 @@ class XecGuardGuardrail(CustomGuardrail):
         }
 
     @staticmethod
-    def _violated_policy_names(result: dict) -> tuple[str, ...]:
-        violations: Final = result.get("xecguard_result")
-        if not isinstance(violations, list):
-            return ()
-        names: Final = (v.get("violated_policy_name") for v in violations if isinstance(v, dict))
+    def _violations(result: Mapping[str, object]) -> tuple[Mapping[str, object], ...]:
+        """``/scan`` returns a list of violations, ``/grounding`` a single object."""
+        raw: Final = result.get("xecguard_result")
+        items: Final[Sequence[object]] = cast(list[object], raw) if isinstance(raw, list) else (raw,)
+        return tuple(cast(dict[str, object], v) for v in items if isinstance(v, dict))
+
+    @classmethod
+    def _violated_policy_names(cls, result: Mapping[str, object]) -> tuple[str, ...]:
+        names: Final = (v.get("violated_policy_name") for v in cls._violations(result))
         return tuple(dict.fromkeys(name for name in names if isinstance(name, str) and name))
 
     @staticmethod

@@ -4569,3 +4569,199 @@ class TestXecGuardStreamingChatBlock:
         assert "trace-r" in text and "PolicyX" in text
         assert '"finish_reason": "content_filter"' in text
         assert text.rstrip().endswith("}")
+
+
+def _slg_entries(request_data: dict) -> list:
+    return request_data["metadata"].get("standard_logging_guardrail_information") or []
+
+
+def _stream_guardrail(**overrides):
+    params = dict(
+        api_key="xgs_test",
+        guardrail_name="stream-gr",
+        event_hook="post_call",
+        stream_mode="window",
+        stream_chunk=2,
+        stream_context=1,
+    )
+    params.update(overrides)
+    return XecGuardGuardrail(**params)
+
+
+@pytest.mark.usefixtures("_clean_env")
+class TestXecGuardStreamingKeyTargetingAndMeta:
+    @pytest.mark.asyncio
+    async def test_a_key_outside_the_allowlist_is_passed_through_unscanned(self):
+        gr = _stream_guardrail(apply_to_aliases=["other-key"])
+        scan = AsyncMock(return_value=UNSAFE_SCAN)
+        with patch.object(gr, "_call_scan", new=scan):
+            out = await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=MagicMock(),
+                    response=_fake_stream(["a", "b", "c"]),
+                    request_data=_meta_request_data(alias="team-alpha"),
+                )
+            )
+        assert [c.choices[0].delta.content for c in out] == ["a", "b", "c"]
+        scan.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream_mode", ["window", "buffer"])
+    async def test_the_stream_scan_carries_the_calling_keys_meta(self, stream_mode):
+        gr = _stream_guardrail(stream_mode=stream_mode, send_meta=True)
+        resp = _make_response({"decision": "SAFE", "trace_id": "t"})
+        with patch.object(gr.async_handler, "post", return_value=resp) as post:
+            await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=MagicMock(),
+                    response=_fake_stream(["a", "b"]),
+                    request_data=_meta_request_data(alias="team-alpha"),
+                )
+            )
+        assert post.call_args_list
+        for call in post.call_args_list:
+            assert call.kwargs["json"]["meta"]["virtualkey"] == "team-alpha"
+
+
+@pytest.mark.usefixtures("_clean_env")
+class TestXecGuardStreamingOutcomeRecording:
+    @pytest.mark.asyncio
+    async def test_audit_mode_records_the_unsafe_window_as_flagged(self):
+        gr = _stream_guardrail(stream_mode="audit")
+        request_data = _meta_request_data()
+        safe_then_unsafe = [{"decision": "SAFE", "trace_id": "s"}, UNSAFE_SCAN, {"decision": "SAFE"}]
+        with patch.object(gr, "_call_scan", new=AsyncMock(side_effect=safe_then_unsafe)):
+            out = await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=MagicMock(),
+                    response=_fake_stream(["a", "b", "c", "d", "e"]),
+                    request_data=request_data,
+                )
+            )
+        assert [c.choices[0].delta.content for c in out] == ["a", "b", "c", "d", "e"]
+        (entry,) = _slg_entries(request_data)
+        assert entry["guardrail_status"] == "guardrail_flagged"
+        assert entry["guardrail_action"] == "FLAGGED"
+        assert entry["guardrail_mode"] == GuardrailEventHooks.post_call
+        assert entry["violation_categories"] == ["PolicyX"]
+        assert entry["guardrail_response"]["trace_id"] == "trace-r"
+
+    @pytest.mark.asyncio
+    async def test_audit_mode_with_only_safe_windows_records_allowed(self):
+        gr = _stream_guardrail(stream_mode="audit")
+        request_data = _meta_request_data()
+        with patch.object(gr, "_call_scan", new=AsyncMock(return_value={"decision": "SAFE", "trace_id": "s"})):
+            await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=MagicMock(), response=_fake_stream(["a", "b"]), request_data=request_data
+                )
+            )
+        (entry,) = _slg_entries(request_data)
+        assert entry["guardrail_status"] == "success"
+        assert entry["guardrail_action"] == "ALLOWED"
+
+    @pytest.mark.asyncio
+    async def test_a_window_block_is_recorded_as_intervened(self):
+        gr = _stream_guardrail()
+        request_data = _meta_request_data()
+        with patch.object(gr, "_call_scan", new=AsyncMock(return_value=UNSAFE_SCAN)):
+            await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=MagicMock(), response=_fake_stream(["a", "b", "c"]), request_data=request_data
+                )
+            )
+        (entry,) = _slg_entries(request_data)
+        assert entry["guardrail_status"] == "guardrail_intervened"
+        assert entry["guardrail_action"] == "BLOCKED"
+        assert entry["guardrail_mode"] == GuardrailEventHooks.post_call
+        assert entry["guardrail_response"]["request_context"]["policies"] == ("PolicyX",)
+
+    @pytest.mark.asyncio
+    async def test_a_buffer_block_is_recorded_as_intervened(self):
+        gr = _stream_guardrail(stream_mode="buffer")
+        request_data = _meta_request_data()
+        with patch.object(gr, "_call_scan", new=AsyncMock(return_value=UNSAFE_SCAN)):
+            await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=MagicMock(), response=_fake_stream(["a", "b"]), request_data=request_data
+                )
+            )
+        (entry,) = _slg_entries(request_data)
+        assert entry["guardrail_action"] == "BLOCKED"
+
+    @pytest.mark.asyncio
+    async def test_a_stream_whose_scans_all_failed_records_nothing(self):
+        gr = _stream_guardrail()
+        request_data = _meta_request_data()
+        with patch.object(gr, "_call_scan", new=AsyncMock(return_value=None)):
+            await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=MagicMock(), response=_fake_stream(["a", "b", "c"]), request_data=request_data
+                )
+            )
+        assert _slg_entries(request_data) == []
+
+
+@pytest.mark.usefixtures("_clean_env")
+class TestXecGuardGroundingBlockRecording:
+    @pytest.mark.asyncio
+    async def test_a_grounding_block_is_recorded_with_its_policy_and_rationale(self):
+        gr = _extension_guardrail(event_hook="post_call")
+        request_data = _meta_request_data()
+        request_data["response"] = _build_model_response("Peggy Seeger was British.")
+        request_data["metadata"]["xecguard_grounding_documents"] = [{"document_id": "d1", "context": "American."}]
+        grounding_bad = {
+            "decision": "UNSAFE",
+            "trace_id": "g-trace",
+            "xecguard_result": {
+                "violated_policy_name": "Default_Policy_ContextGroundingValidation",
+                "violated_rules_list": ["CONFLICT"],
+                "rationale": "Contradicts document.",
+            },
+        }
+        with patch.object(
+            gr.async_handler,
+            "post",
+            side_effect=[_make_response({"decision": "SAFE", "trace_id": "s"}), _make_response(grounding_bad)],
+        ):
+            with pytest.raises(HTTPException):
+                await gr.apply_guardrail(inputs={"texts": ["x"]}, request_data=request_data, input_type="response")
+        (entry,) = _slg_entries(request_data)
+        assert entry["guardrail_status"] == "guardrail_intervened"
+        assert entry["guardrail_action"] == "BLOCKED"
+        assert entry["guardrail_mode"] == GuardrailEventHooks.post_call
+        assert entry["violation_categories"] == ["Default_Policy_ContextGroundingValidation"]
+        ctx = entry["guardrail_response"]["request_context"]
+        assert ctx["trace_id"] == "g-trace"
+        assert ctx["rationale"] == "Contradicts document."
+
+
+@pytest.mark.usefixtures("_clean_env")
+class TestXecGuardRecordedEventType:
+    async def _record(self, event_hook, input_type="request", mcp=False):
+        gr = _extension_guardrail(event_hook=event_hook)
+        request_data = _meta_request_data()
+        if mcp:
+            request_data["mcp_tool_call_metadata"] = {"name": "tool", "arguments": {}}
+        if input_type == "response":
+            request_data["response"] = _build_model_response("ok")
+        resp = _make_response({"decision": "SAFE", "trace_id": "t"})
+        with patch.object(gr.async_handler, "post", return_value=resp):
+            await gr.apply_guardrail(inputs={"texts": ["hi"]}, request_data=request_data, input_type=input_type)
+        return _slg_entries(request_data)[-1]["guardrail_mode"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("event_hook", "input_type", "mcp", "expected"),
+        [
+            ("pre_call", "request", False, GuardrailEventHooks.pre_call),
+            ("during_call", "request", False, GuardrailEventHooks.during_call),
+            (["pre_call", "during_call"], "request", False, GuardrailEventHooks.pre_call),
+            ("post_call", "response", False, GuardrailEventHooks.post_call),
+            ("pre_mcp_call", "request", True, GuardrailEventHooks.pre_mcp_call),
+            ("during_mcp_call", "request", True, GuardrailEventHooks.during_mcp_call),
+            ("post_mcp_call", "response", True, GuardrailEventHooks.post_mcp_call),
+        ],
+    )
+    async def test_the_recorded_mode_is_the_hook_the_scan_ran_under(self, event_hook, input_type, mcp, expected):
+        assert await self._record(event_hook, input_type, mcp) == expected
