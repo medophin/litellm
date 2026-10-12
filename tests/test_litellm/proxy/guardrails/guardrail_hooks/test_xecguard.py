@@ -4284,6 +4284,25 @@ class TestXecGuardStreamingResponses:
         assert [c.delta for c in out if hasattr(c, "delta")] == ["aa", "bb", "cc", "dd", "ee", "ff"]
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream_mode", ["window", "buffer"])
+    async def test_a_stream_with_no_request_conversation_still_scans_with_a_user_turn(self, stream_mode):
+        gr = self._guardrail(stream_mode=stream_mode)
+        scan = AsyncMock(return_value={"decision": "SAFE"})
+        with patch.object(gr, "_call_scan", new=scan):
+            await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=_route_user("/v1/responses"),
+                    response=_responses_stream(["ab", "cd", "ef", "gh"]),
+                    request_data={"model": "m", "contents": []},
+                )
+            )
+        assert scan.call_args_list
+        for call in scan.call_args_list:
+            roles = [m["role"] for m in call.kwargs["messages"]]
+            assert roles == ["user", "assistant"]
+            assert call.kwargs["messages"][0]["content"] == "(request text unavailable)"
+
+    @pytest.mark.asyncio
     async def test_buffer_mode_replays_the_original_responses_events_when_safe(self):
         gr = self._guardrail(stream_mode="buffer")
         scan = AsyncMock(return_value={"decision": "SAFE"})

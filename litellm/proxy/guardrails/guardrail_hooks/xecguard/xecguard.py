@@ -891,6 +891,14 @@ class XecGuardGuardrail(CustomGuardrail):
                 return len(content.encode("utf-8"))
         return 0
 
+    @staticmethod
+    def _reply_conversation(turns: Sequence[dict], reply: str) -> list[dict]:
+        """The request turns followed by the reply. XecGuard rejects a scan with no user turn,
+        so a route that exposes no request conversation (Gemini) gets a placeholder one."""
+        has_user_turn: Final = any(t.get("role") == "user" and t.get("content") for t in turns)
+        lead: Final = list(turns) if has_user_turn else [*turns, {"role": "user", "content": _NO_REQUEST_TEXT}]
+        return [*lead, {"role": "assistant", "content": reply}]
+
     def _held_tail_start(self, held: Sequence[Any]) -> int:
         """Index of the first withheld event to keep back after a SAFE window: the trailing
         events carrying the last ``stream_context`` bytes, which the next window scans together
@@ -936,10 +944,7 @@ class XecGuardGuardrail(CustomGuardrail):
             )
             window: Final = overlap + text[len(previous[0]) :]
             previous[0] = text
-            messages: Final = [
-                *self._request_turns(translation, request_data),
-                {"role": "assistant", "content": window},
-            ]
+            messages: Final = self._reply_conversation(self._request_turns(translation, request_data), window)
             result: Final = await self._call_scan(
                 messages=messages, scan_type="response", request_data=request_data, suppress_errors=True
             )
@@ -1018,10 +1023,7 @@ class XecGuardGuardrail(CustomGuardrail):
         translation: Final = self._translation_for_route(route, all_chunks[0] if all_chunks else None)
         text: Final = await self._stream_text(translation, all_chunks)
         if text:
-            xg_messages: Final = [
-                *self._request_turns(translation, request_data),
-                {"role": "assistant", "content": text},
-            ]
+            xg_messages: Final = self._reply_conversation(self._request_turns(translation, request_data), text)
             scan_result: Final = await self._call_scan(
                 messages=xg_messages, scan_type="response", request_data=request_data
             )
@@ -1455,15 +1457,7 @@ class XecGuardGuardrail(CustomGuardrail):
         if input_type == "response":
             if not texts:
                 return []
-            lead = (
-                turns
-                if any(t.get("role") == "user" and t.get("content") for t in turns)
-                else [
-                    *turns,
-                    {"role": "user", "content": _NO_REQUEST_TEXT},
-                ]
-            )
-            return [*lead, {"role": "assistant", "content": texts}]
+            return self._reply_conversation(turns, texts)
         if not turns and texts:
             return [{"role": "user", "content": texts}]
         if not turns or turns[-1].get("role") == "user":
