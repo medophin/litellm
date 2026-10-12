@@ -3920,6 +3920,44 @@ class TestXecGuardStructuredMessages:
         sent = await _sent_messages(_extension_guardrail(), body, {"texts": [USER_PROMPT]})
         assert sent == FULL_CONVERSATION
 
+    GEMINI_BODY = {
+        "model": "gemini-2.5-flash",
+        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "contents": [
+            {"role": "user", "parts": [{"text": "Q1"}]},
+            {"role": "model", "parts": [{"text": "A1"}]},
+            {"role": "user", "parts": [{"text": "Q2"}]},
+        ],
+    }
+    GEMINI_TURNS = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": "Q1"},
+        {"role": "assistant", "content": "A1"},
+        {"role": "user", "content": "Q2"},
+    ]
+
+    @pytest.mark.asyncio
+    async def test_a_gemini_request_keeps_its_system_prompt_and_roles(self):
+        sent = await _sent_messages(_extension_guardrail(), dict(self.GEMINI_BODY), {"texts": ["x"]})
+        assert sent == self.GEMINI_TURNS
+
+    @pytest.mark.asyncio
+    async def test_a_gemini_reply_is_scanned_after_the_request_conversation(self):
+        sent = await _sent_messages(_extension_guardrail(), dict(self.GEMINI_BODY), {"texts": ["R"]}, "response")
+        assert sent == [*self.GEMINI_TURNS, {"role": "assistant", "content": "R"}]
+
+    @pytest.mark.asyncio
+    async def test_a_gemini_system_instruction_under_config_is_kept(self):
+        body = {**self.GEMINI_BODY, "config": {"systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]}}}
+        del body["systemInstruction"]
+        sent = await _sent_messages(_extension_guardrail(), body, {"texts": ["x"]})
+        assert sent == self.GEMINI_TURNS
+
+    @pytest.mark.asyncio
+    async def test_a_body_that_is_not_generate_content_is_not_read_as_one(self):
+        sent = await _sent_messages(_extension_guardrail(), {"input": "x"}, {"texts": ["x"]})
+        assert sent == [{"role": "user", "content": "x"}]
+
     @pytest.mark.asyncio
     async def test_no_conversation_scans_extracted_texts_as_user_turn(self):
         # Routes whose translation has no role-tagged conversation (Gemini generateContent)
@@ -4301,6 +4339,31 @@ class TestXecGuardStreamingResponses:
             roles = [m["role"] for m in call.kwargs["messages"]]
             assert roles == ["user", "assistant"]
             assert call.kwargs["messages"][0]["content"] == "(request text unavailable)"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream_mode", ["window", "buffer"])
+    async def test_a_gemini_stream_scan_carries_the_request_conversation(self, stream_mode):
+        gr = self._guardrail(stream_mode=stream_mode)
+        scan = AsyncMock(return_value={"decision": "SAFE"})
+        body = {
+            "model": "m",
+            "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+            "contents": [{"role": "user", "parts": [{"text": USER_PROMPT}]}],
+        }
+        with patch.object(gr, "_call_scan", new=scan):
+            await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=_route_user("/v1/responses"),
+                    response=_responses_stream(["ab", "cd", "ef", "gh"]),
+                    request_data=body,
+                )
+            )
+        assert scan.call_args_list
+        for call in scan.call_args_list:
+            assert call.kwargs["messages"][:-1] == [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": USER_PROMPT},
+            ]
 
     @pytest.mark.asyncio
     async def test_buffer_mode_replays_the_original_responses_events_when_safe(self):

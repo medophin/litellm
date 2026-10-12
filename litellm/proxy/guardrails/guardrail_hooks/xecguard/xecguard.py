@@ -1429,8 +1429,40 @@ class XecGuardGuardrail(CustomGuardrail):
         builds one (e.g. a direct ``/guardrails/apply_guardrail`` call).
         """
         structured: Final = translation.get_structured_messages(dict(request_data)) if translation else None
-        turns: Final = structured if structured else request_data.get("messages") or []
+        turns: Final = (
+            structured or XecGuardGuardrail._generate_content_turns(request_data) or request_data.get("messages") or []
+        )
         return [XecGuardGuardrail._normalize_message(m) for m in turns if isinstance(m, dict)]
+
+    @staticmethod
+    def _generate_content_turns(request_data: Mapping[str, Any]) -> list[dict]:
+        """Gemini ``generateContent`` bodies through litellm's own Gemini -> OpenAI adapter, for
+        routes whose translation does not build structured messages. Empty for any other body."""
+        contents: Final = request_data.get("contents")
+        if not contents:
+            return []
+        from litellm.google_genai.adapters.transformation import GoogleGenAIAdapter
+
+        config: Final = request_data.get("config")
+        system_instruction: Final = (
+            request_data.get("systemInstruction")
+            or request_data.get("system_instruction")
+            or (
+                config.get("systemInstruction") or config.get("system_instruction")
+                if isinstance(config, Mapping)
+                else None
+            )
+        )
+        try:
+            request: Final = GoogleGenAIAdapter().translate_generate_content_to_completion(
+                model=str(request_data.get("model") or ""),
+                contents=contents,
+                systemInstruction=system_instruction,
+            )
+        except Exception as exc:
+            verbose_proxy_logger.debug("XecGuard: could not read generateContent body (%s)", exc)
+            return []
+        return [m for m in request.get("messages") or [] if isinstance(m, dict)]
 
     def _build_full_history(
         self,
