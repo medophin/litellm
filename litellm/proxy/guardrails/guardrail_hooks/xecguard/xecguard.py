@@ -230,6 +230,9 @@ def _sanitized_meta_text(text: str) -> str | None:
     return cleaned or None
 
 
+_SSE_TEXT_FIELD = re.compile(r'"(?:text|partial_json)"\s*:\s*"((?:[^"\\]|\\.)*)"')
+
+
 class _TextCapture(CustomGuardrail):
     """Takes the reply text a litellm translation hands to ``apply_guardrail`` and nothing
     else - how XecGuard reads a response with litellm's own per-endpoint parsing."""
@@ -271,8 +274,8 @@ class XecGuardGuardrail(CustomGuardrail):
         block_on_error: bool | None = None,
         grounding_strictness: str | None = None,
         stream_mode: Literal["window", "buffer", "audit"] = "window",
-        stream_chunk: int = 40,
-        stream_context: int = 10,
+        stream_chunk: int = 1200,
+        stream_context: int = 120,
         stream_first: bool = True,
         **kwargs: Any,
     ) -> None:
@@ -753,8 +756,8 @@ class XecGuardGuardrail(CustomGuardrail):
     ) -> AsyncGenerator[Any, None]:
         """Streaming-output scan, mode chosen by ``stream_mode``.
 
-        - ``window``: rolling-window scan every ``stream_chunk`` deltas
-          (``stream_context`` overlap deltas + new ones); UNSAFE cuts the
+        - ``window``: rolling-window scan every ``stream_chunk`` bytes
+          (``stream_context`` overlap bytes + new text); UNSAFE cuts the
           stream mid-flight. ``stream_first`` (default True) releases each
           delta before it's covered by a scan (matches NeMo's default);
           scan errors fail open (never block on a XecGuard outage).
@@ -871,6 +874,22 @@ class XecGuardGuardrail(CustomGuardrail):
             ]
         )
 
+    @staticmethod
+    def _raw_size(chunk: Any) -> int:
+        """Rough size of the reply text one stream event carries, used only to decide when a
+        window is due; the exact text is read through litellm's translation at scan time."""
+        if isinstance(chunk, (bytes, str)):
+            raw = chunk.decode("utf-8", errors="ignore") if isinstance(chunk, bytes) else chunk
+            return sum(len(m) for m in _SSE_TEXT_FIELD.findall(raw))
+        for holder in (getattr(chunk, "choices", None), None):
+            try:
+                content = holder[0].delta.content if holder else getattr(chunk, "delta", None)
+            except (AttributeError, IndexError, TypeError):
+                content = None
+            if isinstance(content, str):
+                return len(content.encode("utf-8"))
+        return 0
+
     async def _window_scan_stream(
         self,
         response: Any,
@@ -878,12 +897,14 @@ class XecGuardGuardrail(CustomGuardrail):
         route: str | None,
         audit_only: bool,
     ) -> AsyncGenerator[Any, None]:
-        """Every ``stream_chunk`` events the text so far is read through litellm's translation
-        for the route; the scanned window is the text the new events added, preceded by the
-        text of the ``stream_context`` events before them."""
+        """Once ``stream_chunk`` bytes have arrived since the last scan, the text so far is read
+        through litellm's translation for the route (one read); the scanned window is the new
+        text, preceded by the last ``stream_context`` bytes of the text already scanned."""
         translations: Final[list[BaseTranslation | None]] = []  # mutable-ok: resolved from the first event
         chunks: Final[list[Any]] = []  # mutable-ok: every event pulled so far, re-read for text at each window
         scanned: Final[list[int]] = [0]  # mutable-ok: how many events the last window covered
+        previous: Final[list[str]] = [""]  # mutable-ok: reply text the last window covered
+        pending: Final[list[int]] = [0]  # mutable-ok: rough bytes received since the last window
         held: Final[list[Any]] = []  # mutable-ok: events withheld until their window is scanned (stream_first off)
         released: Final[list[Any]] = []  # mutable-ok: events the client already holds
         flagged: Final[list[dict]] = []  # mutable-ok: audit hits collected while the stream runs
@@ -891,16 +912,21 @@ class XecGuardGuardrail(CustomGuardrail):
 
         async def scan_window() -> dict | None:
             translation: Final = translations[0] if translations else None
-            context_from: Final = max(0, scanned[0] - self.stream_context)
-            before_window: Final = await self._stream_text(translation, chunks[: scanned[0]])
-            before_context: Final = await self._stream_text(translation, chunks[:context_from])
             text: Final = await self._stream_text(translation, chunks)
             scanned[0] = len(chunks)
-            if len(text) <= len(before_window):
+            pending[0] = 0
+            if len(text) <= len(previous[0]):
                 return None
+            overlap: Final = (
+                previous[0].encode("utf-8")[-self.stream_context :].decode("utf-8", errors="ignore")
+                if self.stream_context
+                else ""
+            )
+            window: Final = overlap + text[len(previous[0]) :]
+            previous[0] = text
             messages: Final = [
                 *self._request_turns(translation, request_data),
-                {"role": "assistant", "content": text[len(before_context) :]},
+                {"role": "assistant", "content": window},
             ]
             result: Final = await self._call_scan(
                 messages=messages, scan_type="response", request_data=request_data, suppress_errors=True
@@ -920,7 +946,8 @@ class XecGuardGuardrail(CustomGuardrail):
                 yield chunk
             else:
                 held.append(chunk)
-            if len(chunks) % self.stream_chunk:
+            pending[0] += self._raw_size(chunk)
+            if pending[0] < self.stream_chunk:
                 continue
             result = await scan_window()
             if result is not None and result.get("decision") == "UNSAFE" and not audit_only:
@@ -933,7 +960,7 @@ class XecGuardGuardrail(CustomGuardrail):
                 yield held_chunk
             held.clear()
 
-        result = await scan_window() if len(chunks) % self.stream_chunk else None
+        result = await scan_window() if len(chunks) > scanned[0] else None
         if result is not None and result.get("decision") == "UNSAFE" and not audit_only:
             self._record_block(request_data, result, GuardrailEventHooks.post_call)
             for event in self._block_events(result, request_data, route, released):

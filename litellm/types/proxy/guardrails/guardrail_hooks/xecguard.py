@@ -170,13 +170,15 @@ class XecGuardConfigModel(GuardrailConfigModel):
     )
     stream_chunk: int | None = Field(
         default=None,
-        description=("Number of new deltas that trigger a window scan in 'window'/'audit' mode. Defaults to 40."),
+        description=(
+            "Bytes of new reply text that trigger a window scan in 'window'/'audit' mode. Defaults to 1200 (about 300 tokens)."
+        ),
     )
     stream_context: int | None = Field(
         default=None,
         description=(
-            "Number of prior deltas kept as overlap context for each window scan in "
-            "'window'/'audit' mode. Defaults to 10."
+            "Bytes of already-scanned text kept as overlap context for each window scan in "
+            "'window'/'audit' mode. Defaults to 120 (about 40 tokens)."
         ),
     )
     stream_first: bool | None = Field(

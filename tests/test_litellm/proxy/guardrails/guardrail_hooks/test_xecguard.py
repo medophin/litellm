@@ -1912,8 +1912,8 @@ class TestXecGuardLoggingHook:
 class TestXecGuardStreaming:
     def test_streaming_config_defaults(self, xecguard_guardrail):
         assert xecguard_guardrail.stream_mode == "window"
-        assert xecguard_guardrail.stream_chunk == 40
-        assert xecguard_guardrail.stream_context == 10
+        assert xecguard_guardrail.stream_chunk == 1200
+        assert xecguard_guardrail.stream_context == 120
         assert xecguard_guardrail.stream_first is True
 
     def test_streaming_hook_is_own_override(self, xecguard_guardrail):
@@ -2240,8 +2240,8 @@ class TestXecGuardInitializer:
         params = LitellmParams(guardrail="xecguard", mode="post_call", api_key="xgs_init")
         cb = initialize_guardrail(litellm_params=params, guardrail={"guardrail_name": "xg-stream-default"})
         assert cb.stream_mode == "window"
-        assert cb.stream_chunk == 40
-        assert cb.stream_context == 10
+        assert cb.stream_chunk == 1200
+        assert cb.stream_context == 120
         assert cb.stream_first is True
 
     def test_initializer_forwards_every_configurable_field(self):
@@ -4138,7 +4138,7 @@ class TestXecGuardStreamingResponses:
     @staticmethod
     def _guardrail(**kw):
         return XecGuardGuardrail(
-            api_key="xgs_test", stream_mode=kw.pop("stream_mode", "window"), stream_chunk=2, stream_context=1, **kw
+            api_key="xgs_test", stream_mode=kw.pop("stream_mode", "window"), stream_chunk=4, stream_context=1, **kw
         )
 
     @pytest.mark.asyncio
@@ -4153,10 +4153,10 @@ class TestXecGuardStreamingResponses:
                     request_data=dict(RESPONSES_BODY),
                 )
             )
-        # the lifecycle event takes a slot but has no text, so window 1 is created + "ab"; each later
-        # window repeats `stream_context` (1) earlier piece, then adds the next `stream_chunk` (2) pieces
+        # a window is due every `stream_chunk` (4) bytes of text; each later window repeats the
+        # last `stream_context` (1) byte of what was already scanned
         windows = [c.kwargs["messages"][-1]["content"] for c in scan.call_args_list]
-        assert windows == ["ab", "abcdef", "efgh"]
+        assert windows == ["abcd", "defgh"]
         for call in scan.call_args_list:
             assert call.kwargs["messages"][:-1] == FULL_CONVERSATION
 
@@ -4228,14 +4228,14 @@ class TestXecGuardStreamingResponses:
             out = await _drain(
                 gr.async_post_call_streaming_iterator_hook(
                     user_api_key_dict=_route_user("/v1/responses"),
-                    response=_responses_stream(["a", "bad1", "bad2", "bad3"]),
+                    response=_responses_stream(["abc", "d", "bad2", "bad3"]),
                     request_data=dict(RESPONSES_BODY),
                 )
             )
         released = [c.delta for c in out if hasattr(c, "delta")]
-        assert released == ["a"]
+        assert released == ["abc", "d"]
         block = _block_text([c for c in out if isinstance(c, bytes)])
-        assert "bad1" not in block
+        assert "bad2" not in block
         # the client already holds the first batch, so the block must continue that response
         assert "response.created" not in block and "response.completed" in block
 
@@ -4606,7 +4606,7 @@ class TestXecGuardReadsThroughLitellmTranslation:
 
     @pytest.mark.asyncio
     async def test_a_gemini_stream_window_scans_the_streamed_text(self):
-        gr = _stream_guardrail(stream_chunk=2, stream_context=0)
+        gr = _stream_guardrail(stream_chunk=6, stream_context=0)
         scan = AsyncMock(return_value={"decision": "SAFE"})
         with patch.object(gr, "_call_scan", new=scan):
             out = await _drain(
@@ -4621,7 +4621,7 @@ class TestXecGuardReadsThroughLitellmTranslation:
 
     @pytest.mark.asyncio
     async def test_an_anthropic_stream_window_carries_the_request_and_the_text(self):
-        gr = _stream_guardrail(stream_chunk=2, stream_context=1)
+        gr = _stream_guardrail(stream_chunk=4, stream_context=1)
         scan = AsyncMock(return_value={"decision": "SAFE"})
         with patch.object(gr, "_call_scan", new=scan):
             await _drain(
@@ -4631,10 +4631,10 @@ class TestXecGuardReadsThroughLitellmTranslation:
                     request_data=dict(ANTHROPIC_BODY),
                 )
             )
-        # events: start, ab | cd, ef | stop  -> windows read 2 events at a time, each
-        # reaching back over the text of the `stream_context` (1) event before it
+        # a window is due every `stream_chunk` (4) bytes of text: "abcd", then the rest
+        # ("ef") behind `stream_context` (1) byte of what was already scanned
         windows = [c.kwargs["messages"][-1]["content"] for c in scan.call_args_list]
-        assert windows == ["ab", "abcdef"]
+        assert windows == ["abcd", "def"]
         for call in scan.call_args_list:
             assert call.kwargs["messages"][:-1] == FULL_CONVERSATION
 
