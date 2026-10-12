@@ -4245,11 +4245,43 @@ class TestXecGuardStreamingResponses:
                 )
             )
         released = [c.delta for c in out if hasattr(c, "delta")]
-        assert released == ["abc", "d"]
+        assert released == ["abc"]
         block = _block_text([c for c in out if isinstance(c, bytes)])
         assert "bad2" not in block
         # the client already holds the first batch, so the block must continue that response
         assert "response.created" not in block and "response.completed" in block
+
+    @pytest.mark.asyncio
+    async def test_hold_mode_keeps_the_overlap_tail_back_until_the_next_window_is_scanned(self):
+        gr = XecGuardGuardrail(
+            api_key="xgs_test", stream_mode="window", stream_chunk=6, stream_context=4, stream_first=False
+        )
+        with patch.object(gr, "_call_scan", new=AsyncMock(side_effect=[{"decision": "SAFE"}, UNSAFE_SCAN])):
+            out = await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=_route_user("/v1/responses"),
+                    response=_responses_stream(["aa", "bb", "cc", "dd", "ee", "ff"]),
+                    request_data=dict(RESPONSES_BODY),
+                )
+            )
+        # the first window (aabbcc) was SAFE, but its last 4 bytes (bbcc) overlap the next window,
+        # so only "aa" may reach the client before that one is scanned and found UNSAFE
+        assert [c.delta for c in out if hasattr(c, "delta")] == ["aa"]
+
+    @pytest.mark.asyncio
+    async def test_hold_mode_still_delivers_the_held_tail_in_order_when_the_stream_is_safe(self):
+        gr = XecGuardGuardrail(
+            api_key="xgs_test", stream_mode="window", stream_chunk=6, stream_context=4, stream_first=False
+        )
+        with patch.object(gr, "_call_scan", new=AsyncMock(return_value={"decision": "SAFE"})):
+            out = await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=_route_user("/v1/responses"),
+                    response=_responses_stream(["aa", "bb", "cc", "dd", "ee", "ff"]),
+                    request_data=dict(RESPONSES_BODY),
+                )
+            )
+        assert [c.delta for c in out if hasattr(c, "delta")] == ["aa", "bb", "cc", "dd", "ee", "ff"]
 
     @pytest.mark.asyncio
     async def test_buffer_mode_replays_the_original_responses_events_when_safe(self):

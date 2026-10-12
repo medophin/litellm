@@ -891,6 +891,17 @@ class XecGuardGuardrail(CustomGuardrail):
                 return len(content.encode("utf-8"))
         return 0
 
+    def _held_tail_start(self, held: Sequence[Any]) -> int:
+        """Index of the first withheld event to keep back after a SAFE window: the trailing
+        events carrying the last ``stream_context`` bytes, which the next window scans together
+        with what follows, so an entity cut by the window edge is never half released."""
+        covered = 0
+        for index in range(len(held) - 1, -1, -1):
+            if covered >= self.stream_context:
+                return index + 1
+            covered += self._raw_size(held[index])
+        return 0
+
     async def _window_scan_stream(
         self,
         response: Any,
@@ -956,10 +967,12 @@ class XecGuardGuardrail(CustomGuardrail):
                 for event in self._block_events(result, request_data, route, released):
                     yield event
                 return
-            released.extend(held)
-            for held_chunk in held:
+            tail_start: Final = self._held_tail_start(held)
+            safe_events: Final = held[:tail_start]
+            released.extend(safe_events)
+            for held_chunk in safe_events:
                 yield held_chunk
-            held.clear()
+            del held[:tail_start]
 
         result = await scan_window() if len(chunks) > scanned[0] else None
         if result is not None and result.get("decision") == "UNSAFE" and not audit_only:
