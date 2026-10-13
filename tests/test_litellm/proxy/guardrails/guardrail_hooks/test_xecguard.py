@@ -5244,6 +5244,131 @@ class TestXecGuardReadsThroughLitellmTranslation:
         assert scan.call_args.kwargs["messages"] == [*FULL_CONVERSATION, {"role": "assistant", "content": "OK"}]
 
 
+@pytest.mark.usefixtures("_clean_env")
+class TestXecGuardLoggingOnlyScansWhatTheOtherModesScan:
+    """What ``logging_only`` sends to XecGuard is what a blocking mode would send for the same call. The
+    proxy logs every request as chat messages, with the system prompt kept under ``optional_params``, and
+    logs the reply in whatever shape the upstream model returned."""
+
+    @staticmethod
+    async def _scanned(call_type, kwargs, result):
+        gr = _extension_guardrail(event_hook="logging_only")
+        scan = AsyncMock(return_value={"decision": "SAFE"})
+        with patch.object(gr, "_call_scan", new=scan):
+            await gr.async_logging_hook(
+                kwargs={"model": "m", "standard_logging_object": {}, **kwargs}, result=result, call_type=call_type
+            )
+        return scan.call_args.kwargs if scan.call_args else None
+
+    @staticmethod
+    def _chat_result(text="OK"):
+        from litellm.types.utils import Choices, Message, ModelResponse
+
+        return ModelResponse(choices=[Choices(index=0, message=Message(role="assistant", content=text))])
+
+    @staticmethod
+    def _responses_result(text="OK"):
+        from litellm.types.llms.openai import ResponsesAPIResponse
+
+        return ResponsesAPIResponse(
+            id="resp",
+            created_at=1,
+            model="m",
+            object="response",
+            status="completed",
+            output=[
+                {
+                    "type": "message",
+                    "id": "msg",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": text, "annotations": []}],
+                }
+            ],
+            parallel_tool_calls=True,
+            tool_choice="auto",
+            tools=[],
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_responses_request_keeps_its_instructions(self):
+        sent = await self._scanned(
+            "aresponses",
+            {
+                "messages": [{"role": "user", "content": USER_PROMPT}],
+                "optional_params": {"instructions": SYSTEM_PROMPT},
+            },
+            self._responses_result(),
+        )
+        assert sent["messages"] == [*FULL_CONVERSATION, {"role": "assistant", "content": "OK"}]
+
+    @pytest.mark.asyncio
+    async def test_a_messages_request_answered_by_a_chat_model_scans_the_reply_and_keeps_its_system_prompt(self):
+        sent = await self._scanned(
+            "anthropic_messages",
+            {
+                "messages": [{"role": "user", "content": USER_PROMPT}],
+                "optional_params": {"instructions": SYSTEM_PROMPT},
+            },
+            self._chat_result(),
+        )
+        assert sent["scan_type"] == "response"
+        assert sent["messages"] == [*FULL_CONVERSATION, {"role": "assistant", "content": "OK"}]
+
+    @pytest.mark.asyncio
+    async def test_a_streamed_responses_reply_is_read_from_its_completed_event(self):
+        from litellm.types.llms.openai import ResponseCompletedEvent
+
+        completed = ResponseCompletedEvent(type="response.completed", response=self._responses_result().model_dump())
+        sent = await self._scanned(
+            "aresponses",
+            {"messages": [{"role": "user", "content": USER_PROMPT}], "optional_params": {"instructions": SYSTEM_PROMPT}},
+            completed,
+        )
+        assert sent["scan_type"] == "response"
+        assert sent["messages"] == [*FULL_CONVERSATION, {"role": "assistant", "content": "OK"}]
+
+    @pytest.mark.asyncio
+    async def test_a_system_prompt_logged_at_the_top_level_is_kept(self):
+        sent = await self._scanned(
+            "anthropic_messages",
+            {"messages": [{"role": "user", "content": USER_PROMPT}], "system": SYSTEM_PROMPT},
+            self._chat_result(),
+        )
+        assert sent["messages"][0] == {"role": "system", "content": SYSTEM_PROMPT}
+
+    @pytest.mark.asyncio
+    async def test_a_system_turn_already_in_the_messages_is_not_added_twice(self):
+        sent = await self._scanned(
+            "acompletion",
+            {"messages": FULL_CONVERSATION, "optional_params": {"instructions": SYSTEM_PROMPT}},
+            self._chat_result(),
+        )
+        assert [m["role"] for m in sent["messages"]] == ["system", "user", "assistant"]
+
+    @pytest.mark.asyncio
+    async def test_a_multi_turn_responses_request_keeps_every_turn(self):
+        turns = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "again"},
+        ]
+        logged = {"messages": turns, "optional_params": {"instructions": SYSTEM_PROMPT}}
+        sent = await self._scanned("aresponses", logged, self._responses_result())
+        assert sent["messages"] == [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            *turns,
+            {"role": "assistant", "content": "OK"},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_request_that_ends_on_a_tool_result_is_scanned_with_it(self):
+        conversation = [*TOOL_CONVERSATION[1:3], TOOL_CONVERSATION[3]]
+        sent = await self._scanned("acompletion", {"messages": conversation}, None)
+        assert sent["scan_type"] == "input"
+        assert sent["messages"][-1] == TOOL_CONVERSATION[3]
+
+
 def test_anthropic_stream_stays_on_own_iterator_hook(xecguard_guardrail):
     """proxy/utils.py reroutes /v1/messages streams to the unified guardrail
     unless mask_response_content is set; xecguard must keep its own hook."""

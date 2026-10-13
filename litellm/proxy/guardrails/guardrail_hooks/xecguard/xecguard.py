@@ -694,37 +694,78 @@ class XecGuardGuardrail(CustomGuardrail):
             )
         return kwargs, result
 
+    @staticmethod
+    def _logged_reply_translation(result: Any, call_type: str) -> "BaseTranslation | None":
+        """litellm's translation that reads this logged result. The logged result is not always in
+        the shape ``call_type`` implies (``/v1/messages`` on an OpenAI model logs a chat response),
+        so it is picked by what the result is, and ``call_type`` only decides when that is unclear."""
+        from litellm.llms import get_guardrail_translation_mapping
+        from litellm.types.llms.openai import ResponseCompletedEvent, ResponsesAPIResponse
+        from litellm.types.utils import CallTypes, ModelResponse
+
+        by_result: Final = (
+            CallTypes.aresponses
+            if isinstance(result, (ResponsesAPIResponse, ResponseCompletedEvent))
+            else CallTypes.acompletion
+            if isinstance(result, ModelResponse)
+            else None
+        )
+        try:
+            return get_guardrail_translation_mapping(by_result or CallTypes(call_type))()
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _logged_system_prompt(kwargs: Mapping[str, Any]) -> str | None:
+        """The system prompt of a logged request. It is not part of its ``messages``: a Responses
+        request logs it as ``instructions`` and a Messages request as ``system``, each under
+        ``optional_params`` or at the top level."""
+        sources: Final = (kwargs, kwargs.get("optional_params") or {})
+        for name in ("instructions", "system"):
+            for source in sources:
+                value = source.get(name)
+                if isinstance(value, str) and value:
+                    return value
+        return None
+
     async def _logged_call_history(
         self, kwargs: dict, result: Any, call_type: str
     ) -> tuple[list[dict], Literal["input", "response"]]:
-        """The logged request and, when there is one, its reply, read by litellm's translation
-        for ``call_type``: the reply text through ``process_output_response`` and the request
-        conversation through ``get_structured_messages``."""
+        """The logged request and, when there is one, its reply, read by litellm's translation.
+
+        The request is logged as chat messages whatever endpoint it came in on, so it is read
+        as a chat body with its system prompt put back in front."""
         from litellm.llms import get_guardrail_translation_mapping
+        from litellm.types.llms.openai import ResponseCompletedEvent
         from litellm.types.utils import CallTypes
 
-        try:
-            translation: BaseTranslation | None = get_guardrail_translation_mapping(CallTypes(call_type))()
-        except ValueError:
-            translation = None
         logged_request: Final = {
             "model": kwargs.get("model"),
             "messages": kwargs.get("messages"),
             "input": kwargs.get("input"),
             **(kwargs.get("optional_params") or {}),
         }
-        turns: Final = self._request_turns(translation, logged_request)
+        chat_reader: Final = get_guardrail_translation_mapping(CallTypes.acompletion)()
+        request_turns: Final = self._request_turns(chat_reader, logged_request)
+        system_prompt: Final = self._logged_system_prompt(kwargs)
+        turns: Final = (
+            [{"role": "system", "content": system_prompt}, *request_turns]
+            if system_prompt and not any(t.get("role") == "system" for t in request_turns)
+            else request_turns
+        )
+        translation: Final = self._logged_reply_translation(result, call_type)
         capture: Final = _TextCapture()
-        if translation is not None and result is not None:
+        reply: Final = getattr(result, "response", result) if isinstance(result, ResponseCompletedEvent) else result
+        if translation is not None and reply is not None:
             try:
                 await translation.process_output_response(
-                    response=copy.deepcopy(result), guardrail_to_apply=capture, request_data={}
+                    response=copy.deepcopy(reply), guardrail_to_apply=capture, request_data={}
                 )
             except Exception as exc:
                 verbose_proxy_logger.debug("XecGuard logging_only: could not read the reply: %s", exc)
         if capture.text or capture.tool_calls:
             return [*turns, self._assistant_turn(capture.text, capture.tool_calls)], "response"
-        return (turns if turns and turns[-1].get("role") == "user" else []), "input"
+        return (turns if turns and turns[-1].get("role") in ("user", "tool") else []), "input"
 
     def logging_hook(
         self,
