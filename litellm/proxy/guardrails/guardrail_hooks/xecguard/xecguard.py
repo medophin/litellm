@@ -716,10 +716,20 @@ class XecGuardGuardrail(CustomGuardrail):
             return None
 
     @staticmethod
+    def _logged_original_request(kwargs: Mapping[str, Any]) -> dict | None:
+        """The body the client sent, which the logging payload keeps under ``proxy_server_request``.
+        Unlike the logged ``messages`` it is in the endpoint's own shape, system prompt, tool turns
+        and all, so litellm's translation for that endpoint reads it the way it does on the way in."""
+        litellm_params: Final = kwargs.get("litellm_params")
+        proxy_request: Final = litellm_params.get("proxy_server_request") if isinstance(litellm_params, dict) else None
+        body: Final = proxy_request.get("body") if isinstance(proxy_request, dict) else None
+        return body if isinstance(body, dict) and body else None
+
+    @staticmethod
     def _logged_system_prompt(kwargs: Mapping[str, Any]) -> str | None:
-        """The system prompt of a logged request. It is not part of its ``messages``: a Responses
-        request logs it as ``instructions`` and a Messages request as ``system``, each under
-        ``optional_params`` or at the top level."""
+        """The system prompt of a logged request when only its chat ``messages`` are left. It is not
+        part of them: a Responses request logs it as ``instructions`` and a Messages request as
+        ``system``, each under ``optional_params`` or at the top level."""
         sources: Final = (kwargs, kwargs.get("optional_params") or {})
         for name in ("instructions", "system"):
             for source in sources:
@@ -728,31 +738,43 @@ class XecGuardGuardrail(CustomGuardrail):
                     return value
         return None
 
-    async def _logged_call_history(
-        self, kwargs: dict, result: Any, call_type: str
-    ) -> tuple[list[dict], Literal["input", "response"]]:
-        """The logged request and, when there is one, its reply, read by litellm's translation.
-
-        The request is logged as chat messages whatever endpoint it came in on, so it is read
-        as a chat body with its system prompt put back in front."""
+    def _logged_request_turns(self, kwargs: dict, call_type: str) -> list[dict]:
+        """The request conversation of a logged call: the original body read through litellm's
+        translation for its endpoint, else the logged chat messages with their system prompt back."""
         from litellm.llms import get_guardrail_translation_mapping
-        from litellm.types.llms.openai import ResponseCompletedEvent
         from litellm.types.utils import CallTypes
 
+        original: Final = self._logged_original_request(kwargs)
+        if original is not None:
+            try:
+                translation: Final = get_guardrail_translation_mapping(CallTypes(call_type))()
+                from_body: Final = self._request_turns(translation, original)
+            except Exception as exc:
+                verbose_proxy_logger.debug("XecGuard logging_only: could not read the original request (%s)", exc)
+                from_body = []
+            if from_body:
+                return from_body
         logged_request: Final = {
             "model": kwargs.get("model"),
             "messages": kwargs.get("messages"),
             "input": kwargs.get("input"),
             **(kwargs.get("optional_params") or {}),
         }
-        chat_reader: Final = get_guardrail_translation_mapping(CallTypes.acompletion)()
-        request_turns: Final = self._request_turns(chat_reader, logged_request)
-        system_prompt: Final = self._logged_system_prompt(kwargs)
-        turns: Final = (
-            [{"role": "system", "content": system_prompt}, *request_turns]
-            if system_prompt and not any(t.get("role") == "system" for t in request_turns)
-            else request_turns
+        request_turns: Final = self._request_turns(
+            get_guardrail_translation_mapping(CallTypes.acompletion)(), logged_request
         )
+        system_prompt: Final = self._logged_system_prompt(kwargs)
+        if system_prompt and not any(t.get("role") == "system" for t in request_turns):
+            return [{"role": "system", "content": system_prompt}, *request_turns]
+        return request_turns
+
+    async def _logged_call_history(
+        self, kwargs: dict, result: Any, call_type: str
+    ) -> tuple[list[dict], Literal["input", "response"]]:
+        """The logged request and, when there is one, its reply, both read by litellm's translations."""
+        from litellm.types.llms.openai import ResponseCompletedEvent
+
+        turns: Final = self._logged_request_turns(kwargs, call_type)
         translation: Final = self._logged_reply_translation(result, call_type)
         capture: Final = _TextCapture()
         reply: Final = getattr(result, "response", result) if isinstance(result, ResponseCompletedEvent) else result

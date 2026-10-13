@@ -5316,6 +5316,69 @@ class TestXecGuardLoggingOnlyScansWhatTheOtherModesScan:
         assert sent["messages"] == [*FULL_CONVERSATION, {"role": "assistant", "content": "OK"}]
 
     @pytest.mark.asyncio
+    async def test_a_gemini_request_is_read_from_the_body_the_client_sent(self):
+        body = {
+            "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+            "contents": [{"role": "user", "parts": [{"text": USER_PROMPT}]}],
+        }
+        sent = await self._scanned(
+            "agenerate_content",
+            {
+                "messages": [{"role": "user", "content": USER_PROMPT}],
+                "litellm_params": {"proxy_server_request": {"body": body}},
+            },
+            self._chat_result(),
+        )
+        assert sent["messages"] == [*FULL_CONVERSATION, {"role": "assistant", "content": "OK"}]
+
+    @pytest.mark.asyncio
+    async def test_a_tool_turn_in_the_body_the_client_sent_reaches_the_scan(self):
+        body = {
+            "model": "m",
+            "system": SYSTEM_PROMPT,
+            "max_tokens": 5,
+            "messages": [
+                {"role": "user", "content": "list files"},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "ls", "input": {}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "a.txt"}]},
+            ],
+        }
+        sent = await self._scanned(
+            "anthropic_messages",
+            {"messages": [], "litellm_params": {"proxy_server_request": {"body": body}}},
+            self._chat_result(),
+        )
+        roles = [m["role"] for m in sent["messages"]]
+        assert roles == ["system", "user", "assistant", "tool", "assistant"]
+        assert sent["messages"][2]["tool_calls"][0]["id"] == "t1"
+        assert sent["messages"][3]["tool_call_id"] == "t1"
+
+    @pytest.mark.asyncio
+    async def test_a_body_the_translation_raises_on_falls_back_to_the_logged_messages(self):
+        incomplete = {"max_tokens": 5, "messages": [{"role": "user", "content": "ignored"}]}
+        sent = await self._scanned(
+            "anthropic_messages",
+            {
+                "messages": [{"role": "user", "content": USER_PROMPT}],
+                "litellm_params": {"proxy_server_request": {"body": incomplete}},
+            },
+            self._chat_result(),
+        )
+        assert sent["messages"][0] == {"role": "user", "content": USER_PROMPT}
+
+    @pytest.mark.asyncio
+    async def test_a_body_that_cannot_be_read_falls_back_to_the_logged_messages(self):
+        sent = await self._scanned(
+            "aembedding",
+            {
+                "messages": [{"role": "user", "content": USER_PROMPT}],
+                "litellm_params": {"proxy_server_request": {"body": {"input": "x"}}},
+            },
+            self._chat_result(),
+        )
+        assert sent["messages"][0] == {"role": "user", "content": USER_PROMPT}
+
+    @pytest.mark.asyncio
     async def test_a_streamed_responses_reply_is_read_from_its_completed_event(self):
         from litellm.types.llms.openai import ResponseCompletedEvent
 
