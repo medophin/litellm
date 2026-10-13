@@ -4121,6 +4121,46 @@ async def _chunks_as_stream(chunks: list):
 
 
 @pytest.mark.usefixtures("_clean_env")
+class TestXecGuardWindowReadsOnlyNewEvents:
+    @pytest.mark.asyncio
+    async def test_each_window_reads_only_the_events_since_the_last_one(self):
+        gr = _stream_guardrail(stream_chunk=2, stream_context=0)
+        reads = []
+        real = gr._stream_text
+
+        async def spy(translation, chunks):
+            reads.append(len(chunks))
+            return await real(translation, chunks)
+
+        with (
+            patch.object(gr, "_stream_text", new=spy),
+            patch.object(gr, "_call_scan", new=AsyncMock(return_value={"decision": "SAFE"})),
+        ):
+            await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=_route_user("/chat/completions"),
+                    response=_fake_stream(list("abcdefgh")),
+                    request_data={"model": "m", "messages": FULL_CONVERSATION},
+                )
+            )
+        assert reads == [2, 2, 2, 2]
+
+    @pytest.mark.asyncio
+    async def test_the_windows_still_add_up_to_the_whole_reply_with_their_overlap(self):
+        gr = _stream_guardrail(stream_chunk=3, stream_context=2)
+        scan = AsyncMock(return_value={"decision": "SAFE"})
+        with patch.object(gr, "_call_scan", new=scan):
+            await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=_route_user("/chat/completions"),
+                    response=_fake_stream(list("abcdefgh")),
+                    request_data={"model": "m", "messages": FULL_CONVERSATION},
+                )
+            )
+        assert [c.kwargs["messages"][-1]["content"] for c in scan.call_args_list] == ["abc", "bcdef", "efgh"]
+
+
+@pytest.mark.usefixtures("_clean_env")
 class TestXecGuardStreamedToolCalls:
     @staticmethod
     async def _run(gr, scan_result, chunks):

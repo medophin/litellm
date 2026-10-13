@@ -951,11 +951,11 @@ class XecGuardGuardrail(CustomGuardrail):
         route: str | None,
         audit_only: bool,
     ) -> AsyncGenerator[Any, None]:
-        """Once ``stream_chunk`` bytes have arrived since the last scan, the text so far is read
-        through litellm's translation for the route (one read); the scanned window is the new
-        text, preceded by the last ``stream_context`` bytes of the text already scanned."""
+        """Once ``stream_chunk`` bytes have arrived since the last scan, the events since then are
+        read through litellm's translation for the route; the scanned window is that new text,
+        preceded by the last ``stream_context`` bytes of the text already scanned."""
         translations: Final[list[BaseTranslation | None]] = []  # mutable-ok: resolved from the first event
-        chunks: Final[list[Any]] = []  # mutable-ok: every event pulled so far, re-read for text at each window
+        chunks: Final[list[Any]] = []  # mutable-ok: every event pulled so far; each window reads only the new ones
         scanned: Final[list[int]] = [0]  # mutable-ok: how many events the last window covered
         previous: Final[list[str]] = [""]  # mutable-ok: reply text the last window covered
         pending: Final[list[int]] = [0]  # mutable-ok: rough bytes received since the last window
@@ -983,18 +983,18 @@ class XecGuardGuardrail(CustomGuardrail):
 
         async def scan_window() -> dict | None:
             translation: Final = translations[0] if translations else None
-            text: Final = await self._stream_text(translation, chunks)
+            new_text: Final = await self._stream_text(translation, chunks[scanned[0] :])
             scanned[0] = len(chunks)
             pending[0] = 0
-            if len(text) <= len(previous[0]):
+            if not new_text:
                 return None
             overlap: Final = (
                 previous[0].encode("utf-8")[-self.stream_context :].decode("utf-8", errors="ignore")
                 if self.stream_context
                 else ""
             )
-            window: Final = overlap + text[len(previous[0]) :]
-            previous[0] = text
+            window: Final = overlap + new_text
+            previous[0] += new_text
             messages: Final = self._reply_conversation(self._request_turns(translation, request_data), window)
             result: Final = await self._call_scan(
                 messages=messages, scan_type="response", request_data=request_data, suppress_errors=True
