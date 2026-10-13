@@ -859,7 +859,7 @@ class XecGuardGuardrail(CustomGuardrail):
         from litellm.llms import get_guardrail_translation_mapping
         from litellm.types.utils import CallTypes
 
-        message: Final = f"[Blocked by XecGuard] {self._format_scan_block_message(scan_result)}"
+        message: Final = f"[Blocked by XecGuard] {self._block_message(scan_result)}"
         call_types: Final = get_call_types_for_route(route) if route else None
         if call_types:
             try:
@@ -898,7 +898,7 @@ class XecGuardGuardrail(CustomGuardrail):
         return [f"data: {json.dumps(event)}\n\n".encode()] if event else []
 
     def _build_block_stream_chunk(self, scan_result: dict) -> ModelResponseStream:
-        notice: Final = f"\n\n[Blocked by XecGuard] {self._format_scan_block_message(scan_result)}"
+        notice: Final = f"\n\n[Blocked by XecGuard] {self._block_message(scan_result)}"
         return ModelResponseStream(
             choices=[
                 StreamingChoices(
@@ -1032,9 +1032,14 @@ class XecGuardGuardrail(CustomGuardrail):
 
         result = await scan_window() if len(chunks) > scanned[0] else None
         tool_result: Final = None if result is not None and result.get("decision") == "UNSAFE" else await scan_tool_calls()
-        blocking: Final = next(
-            (r for r in (result, tool_result) if r is not None and r.get("decision") == "UNSAFE"), None
-        )
+        blocking = next((r for r in (result, tool_result) if r is not None and r.get("decision") == "UNSAFE"), None)
+        if blocking is None:
+            grounding_result = await self._stream_grounding(
+                request_data, translations[0] if translations else None, previous[0]
+            )
+            if grounding_result is not None and audit_only:
+                flagged.append(grounding_result)
+            blocking = grounding_result
         if blocking is not None and not audit_only:
             self._record_block(request_data, blocking, GuardrailEventHooks.post_call)
             for event in self._block_events(blocking, request_data, route, released):
@@ -1087,6 +1092,12 @@ class XecGuardGuardrail(CustomGuardrail):
             if scan_result is not None and scan_result.get("decision") == "UNSAFE":
                 self._record_block(request_data, scan_result, GuardrailEventHooks.post_call)
                 for event in self._block_events(scan_result, request_data, route, []):
+                    yield event
+                return
+            grounding_result = await self._stream_grounding(request_data, translation, reply.text)
+            if grounding_result is not None:
+                self._record_block(request_data, grounding_result, GuardrailEventHooks.post_call)
+                for event in self._block_events(grounding_result, request_data, route, []):
                     yield event
                 return
             self._record_stream_end(request_data, (), scan_result)
@@ -1358,6 +1369,18 @@ class XecGuardGuardrail(CustomGuardrail):
             payload=payload,
             suppress_errors=suppress_errors,
         )
+
+    async def _stream_grounding(
+        self, request_data: dict, translation: "BaseTranslation | None", reply_text: str
+    ) -> dict | None:
+        """Grounding check of a finished stream's reply, the way a plain response gets one.
+        Only a reply with text can be grounded, so a tool-call-only stream has nothing to check."""
+        documents: Final = self._extract_grounding_documents(request_data)
+        if not documents or not reply_text:
+            return None
+        messages: Final = self._reply_conversation(self._request_turns(translation, request_data), reply_text)
+        result: Final = await self._call_grounding(messages=messages, documents=documents)
+        return result if result is not None and result.get("decision") == "UNSAFE" else None
 
     async def _call_grounding(
         self,
@@ -1701,6 +1724,13 @@ class XecGuardGuardrail(CustomGuardrail):
     def _violated_policy_names(cls, result: Mapping[str, object]) -> tuple[str, ...]:
         names: Final = (v.get("violated_policy_name") for v in cls._violations(result))
         return tuple(dict.fromkeys(name for name in names if isinstance(name, str) and name))
+
+    @classmethod
+    def _block_message(cls, result: dict) -> str:
+        """``/scan`` answers with a list of violations, ``/grounding`` with a single one."""
+        if isinstance(result.get("xecguard_result"), dict):
+            return cls._format_grounding_block_message(result)
+        return cls._format_scan_block_message(result)
 
     @staticmethod
     def _format_scan_block_message(result: dict) -> str:

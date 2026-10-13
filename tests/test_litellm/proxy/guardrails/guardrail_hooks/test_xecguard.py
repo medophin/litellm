@@ -4185,6 +4185,106 @@ class TestXecGuardStreamedToolCalls:
 
 
 
+GROUNDING_DOCS = [{"document_id": "d1", "context": "Peggy Seeger is American."}]
+GROUNDING_UNSAFE = {
+    "decision": "UNSAFE",
+    "trace_id": "g-trace",
+    "xecguard_result": {
+        "violated_policy_name": "Default_Policy_ContextGroundingValidation",
+        "violated_rules_list": ["CONFLICT"],
+        "rationale": "Contradicts document.",
+    },
+}
+
+
+@pytest.mark.usefixtures("_clean_env")
+class TestXecGuardStreamedGrounding:
+    """A stream is grounded against the documents on the request, as a plain response is."""
+
+    @staticmethod
+    async def _run(gr, grounding_result, documents=GROUNDING_DOCS, pieces=("Peggy ", "Seeger ", "was ", "British.")):
+        request_data = {
+            "model": "m",
+            "messages": FULL_CONVERSATION,
+            "metadata": {"xecguard_grounding_documents": documents} if documents else {},
+        }
+        post = AsyncMock(return_value=grounding_result)
+        with (
+            patch.object(gr, "_call_scan", new=AsyncMock(return_value={"decision": "SAFE"})),
+            patch.object(gr, "_post", new=post),
+        ):
+            out = await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=_route_user("/chat/completions"),
+                    response=_fake_stream(list(pieces)),
+                    request_data=request_data,
+                )
+            )
+        return out, post, request_data
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["window", "buffer"])
+    async def test_the_finished_reply_is_checked_against_the_documents(self, mode):
+        _, post, _ = await self._run(_stream_guardrail(stream_mode=mode), {"decision": "SAFE"})
+        payload = post.call_args.kwargs["payload"]
+        assert post.call_args.kwargs["path"] == "/xecguard/v1/grounding"
+        assert payload["response"] == "Peggy Seeger was British."
+        assert payload["prompt"] == USER_PROMPT
+        assert payload["documents"] == GROUNDING_DOCS
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["window", "buffer"])
+    async def test_a_reply_that_contradicts_the_documents_is_blocked_with_the_grounding_message(self, mode):
+        out, _, request_data = await self._run(_stream_guardrail(stream_mode=mode), GROUNDING_UNSAFE)
+        text = _block_text([e for e in out if isinstance(e, bytes)])
+        assert "grounding" in text and "CONFLICT" in text and "g-trace" in text
+        assert _slg_entries(request_data)[0]["guardrail_status"] == "guardrail_intervened"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["window", "buffer"])
+    async def test_a_grounded_reply_is_delivered_unchanged(self, mode):
+        out, _, _ = await self._run(_stream_guardrail(stream_mode=mode), {"decision": "SAFE"})
+        assert [c.choices[0].delta.content for c in out] == ["Peggy ", "Seeger ", "was ", "British."]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["window", "buffer", "audit"])
+    async def test_no_documents_means_no_grounding_call(self, mode):
+        _, post, _ = await self._run(_stream_guardrail(stream_mode=mode), GROUNDING_UNSAFE, documents=None)
+        post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_scan_block_wins_and_grounding_is_not_asked(self):
+        gr = _stream_guardrail(stream_mode="buffer")
+        post = AsyncMock(return_value=GROUNDING_UNSAFE)
+        with (
+            patch.object(gr, "_call_scan", new=AsyncMock(return_value=UNSAFE_SCAN)),
+            patch.object(gr, "_post", new=post),
+        ):
+            await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=_route_user("/chat/completions"),
+                    response=_fake_stream(["a", "b"]),
+                    request_data={
+                        "model": "m",
+                        "messages": FULL_CONVERSATION,
+                        "metadata": {"xecguard_grounding_documents": GROUNDING_DOCS},
+                    },
+                )
+            )
+        post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_audit_mode_flags_an_ungrounded_reply_without_blocking(self):
+        out, _, request_data = await self._run(_stream_guardrail(stream_mode="audit"), GROUNDING_UNSAFE)
+        assert [c.choices[0].delta.content for c in out] == ["Peggy ", "Seeger ", "was ", "British."]
+        assert _slg_entries(request_data)[0]["guardrail_status"] == "guardrail_flagged"
+
+    @pytest.mark.asyncio
+    async def test_a_grounding_error_does_not_block_the_stream(self):
+        out, _, _ = await self._run(_stream_guardrail(stream_mode="buffer"), None)
+        assert [c.choices[0].delta.content for c in out] == ["Peggy ", "Seeger ", "was ", "British."]
+
+
 @pytest.mark.usefixtures("_clean_env")
 class TestXecGuardSkipSystemWarning:
     """A framework flag can strip the system prompt out of structured_messages;
