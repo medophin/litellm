@@ -96,7 +96,8 @@ def _poc_safe(obj: object, depth: int = 0) -> object:
         return obj if len(obj) <= 4000 else obj[:4000] + f"...<+{len(obj) - 4000} chars>"
     if hasattr(obj, "model_dump"):
         try:
-            return _poc_safe(obj.model_dump(), depth + 1)  # pyright: ignore[reportAttributeAccessIssue]  # duck-typed pydantic BaseModel
+            dumped = obj.model_dump()  # pyright: ignore[reportAttributeAccessIssue]  # duck-typed pydantic BaseModel
+            return _poc_safe(dumped, depth + 1)
         except Exception:
             return str(obj)[:4000]
     if isinstance(obj, Mapping):
@@ -744,6 +745,7 @@ class XecGuardGuardrail(CustomGuardrail):
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
             if loop.is_running():
+                verbose_proxy_logger.debug("XecGuard sync logging_hook skipped: an event loop is already running")
                 return kwargs, result
             loop.run_until_complete(self.async_logging_hook(kwargs=kwargs, result=result, call_type=call_type))
         except Exception as exc:
@@ -802,8 +804,8 @@ class XecGuardGuardrail(CustomGuardrail):
         """litellm's own request/response translation for the endpoint this call came in on,
         or - with no route to go by - for the response shape ``sample`` has, the way the
         unified guardrail resolves it."""
-        from litellm.cost_calculator import (  # pyright: ignore[reportPrivateUsage]  # same resolver the unified guardrail uses
-            _infer_call_type,
+        from litellm.cost_calculator import (
+            _infer_call_type,  # pyright: ignore[reportPrivateUsage]  # same resolver the unified guardrail uses
         )
         from litellm.litellm_core_utils.api_route_to_call_types import get_call_types_for_route
         from litellm.llms import get_guardrail_translation_mapping
@@ -840,7 +842,8 @@ class XecGuardGuardrail(CustomGuardrail):
 
     @staticmethod
     def _assistant_turn(text: str, tool_calls: Sequence[Any]) -> dict:
-        return {"role": "assistant", "content": text or None, **({"tool_calls": list(tool_calls)} if tool_calls else {})}
+        calls: Final = {"tool_calls": list(tool_calls)} if tool_calls else {}
+        return {"role": "assistant", "content": text or None, **calls}
 
     def _block_events(
         self,
@@ -893,7 +896,7 @@ class XecGuardGuardrail(CustomGuardrail):
                 chunk, GoogleGenAIStreamWrapper(iter(()))
             )
         except Exception as exc:
-            verbose_proxy_logger.debug("XecGuard: could not convert block to a generateContent event (%s)", exc)
+            verbose_proxy_logger.warning("XecGuard: could not convert block to a generateContent event (%s)", exc)
             return []
         return [f"data: {json.dumps(event)}\n\n".encode()] if event else []
 
@@ -1558,7 +1561,7 @@ class XecGuardGuardrail(CustomGuardrail):
                 systemInstruction=system_instruction,
             )
         except Exception as exc:
-            verbose_proxy_logger.debug("XecGuard: could not read generateContent body (%s)", exc)
+            verbose_proxy_logger.warning("XecGuard: could not read generateContent body, scanning without it (%s)", exc)
             return []
         return [m for m in request.get("messages") or [] if isinstance(m, dict)]
 

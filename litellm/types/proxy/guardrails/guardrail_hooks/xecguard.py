@@ -40,8 +40,10 @@ class XecGuardConfigModel(GuardrailConfigModel):
         description=(
             "XecGuard policies to apply on each scan. Select one or more "
             "of the built-in default policies; if none are selected, "
-            "the guardrail defaults to System Prompt Enforcement + "
-            "Harmful Content Protection."
+            "the guardrail defaults to System Prompt Enforcement, "
+            "Harmful Content Protection and General Prompt Attack Protection. "
+            "Only the text of a message is scanned: images and other non-text "
+            "content are not sent to XecGuard."
         ),
         json_schema_extra={
             "ui_type": "multiselect",
@@ -171,7 +173,8 @@ class XecGuardConfigModel(GuardrailConfigModel):
     stream_chunk: int | None = Field(
         default=None,
         description=(
-            "Bytes of new reply text that trigger a window scan in 'window'/'audit' mode. Defaults to 1200 (about 300 tokens)."
+            "Bytes of new reply text that trigger a window scan in 'window'/'audit' mode. "
+            "Defaults to 1200 (about 300 tokens)."
         ),
     )
     stream_context: int | None = Field(

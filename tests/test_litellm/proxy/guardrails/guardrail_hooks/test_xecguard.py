@@ -3950,6 +3950,18 @@ class TestXecGuardStructuredMessages:
         sent = await _sent_messages(_extension_guardrail(), body, {"texts": ["x"]})
         assert sent == self.GEMINI_TURNS
 
+    def test_a_generate_content_body_litellm_cannot_read_is_warned_about_and_scans_without_it(self):
+        from litellm.proxy.guardrails.guardrail_hooks.xecguard import xecguard as module
+
+        adapter = "litellm.google_genai.adapters.transformation.GoogleGenAIAdapter.translate_generate_content_to_completion"
+        with (
+            patch(adapter, side_effect=ValueError("bad body")),
+            patch.object(module.verbose_proxy_logger, "warning") as warn,
+        ):
+            turns = XecGuardGuardrail._generate_content_turns({"contents": [{"role": "user", "parts": []}]})
+        assert turns == []
+        assert "bad body" in str(warn.call_args)
+
     @pytest.mark.asyncio
     async def test_a_body_that_is_not_generate_content_is_not_read_as_one(self):
         sent = await _sent_messages(_extension_guardrail(), {"input": "x"}, {"texts": ["x"]})
