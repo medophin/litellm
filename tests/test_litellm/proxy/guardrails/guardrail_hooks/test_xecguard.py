@@ -2008,16 +2008,13 @@ class TestXecGuardStreaming:
         assert mock_scan.call_count == 2
 
     @pytest.mark.asyncio
-    async def test_window_mode_scan_error_fails_open(self, mock_request_data):
-        """XecGuard being unreachable must never block a stream in window
-        mode, regardless of ``block_on_error`` - this is what distinguishes
-        it from buffer mode's error handling."""
+    async def test_window_mode_scan_error_fails_open_when_block_on_error_is_off(self, mock_request_data):
         guardrail = XecGuardGuardrail(
             api_key="xgs_test",
             stream_mode="window",
             stream_chunk=2,
             stream_context=1,
-            block_on_error=True,
+            block_on_error=False,
         )
         with patch.object(
             guardrail.async_handler, "post", side_effect=httpx.ConnectError("refused")
@@ -4238,6 +4235,49 @@ GROUNDING_UNSAFE = {
 
 
 @pytest.mark.usefixtures("_clean_env")
+class TestXecGuardStreamedScanErrors:
+    """A stream scan that cannot reach XecGuard follows ``block_on_error``, as a plain response does."""
+
+    @staticmethod
+    async def _run(mode, block_on_error, **kw):
+        gr = _stream_guardrail(stream_mode=mode, block_on_error=block_on_error, **kw)
+        request_data = {"model": "m", "messages": FULL_CONVERSATION}
+        with patch.object(gr.async_handler, "post", side_effect=httpx.ConnectError("refused")):
+            out = await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=_route_user("/chat/completions"),
+                    response=_fake_stream(["a", "b", "c", "d"]),
+                    request_data=request_data,
+                )
+            )
+        return out, request_data
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["window", "buffer"])
+    async def test_an_unreachable_xecguard_ends_the_stream_with_a_block_when_block_on_error_is_on(self, mode):
+        out, request_data = await self._run(mode, True)
+        text = _block_text([e for e in out if isinstance(e, bytes)])
+        assert "XecGuardUnavailable" in text and "content_filter" in text
+        assert _slg_entries(request_data)[0]["guardrail_status"] == "guardrail_intervened"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["window", "buffer"])
+    async def test_an_unreachable_xecguard_lets_the_stream_through_when_block_on_error_is_off(self, mode):
+        out, _ = await self._run(mode, False)
+        assert [c.choices[0].delta.content for c in out] == ["a", "b", "c", "d"]
+
+    @pytest.mark.asyncio
+    async def test_hold_mode_does_not_release_text_no_scan_covered(self):
+        out, _ = await self._run("window", True, stream_first=False)
+        assert not [c for c in out if not isinstance(c, bytes)]
+
+    @pytest.mark.asyncio
+    async def test_audit_mode_never_blocks_on_an_unreachable_xecguard(self):
+        out, _ = await self._run("audit", True)
+        assert [c.choices[0].delta.content for c in out] == ["a", "b", "c", "d"]
+
+
+@pytest.mark.usefixtures("_clean_env")
 class TestXecGuardStreamedGrounding:
     """A stream is grounded against the documents on the request, as a plain response is."""
 
@@ -4320,9 +4360,17 @@ class TestXecGuardStreamedGrounding:
         assert _slg_entries(request_data)[0]["guardrail_status"] == "guardrail_flagged"
 
     @pytest.mark.asyncio
-    async def test_a_grounding_error_does_not_block_the_stream(self):
-        out, _, _ = await self._run(_stream_guardrail(stream_mode="buffer"), None)
+    async def test_a_grounding_error_does_not_block_the_stream_when_block_on_error_is_off(self):
+        out, _, _ = await self._run(_stream_guardrail(stream_mode="buffer", block_on_error=False), None)
         assert [c.choices[0].delta.content for c in out] == ["Peggy ", "Seeger ", "was ", "British."]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["window", "buffer"])
+    async def test_a_grounding_error_blocks_the_stream_when_block_on_error_is_on(self, mode):
+        out, _, request_data = await self._run(_stream_guardrail(stream_mode=mode, block_on_error=True), None)
+        text = _block_text([e for e in out if isinstance(e, bytes)])
+        assert "XecGuardUnavailable" in text
+        assert _slg_entries(request_data)[0]["guardrail_status"] == "guardrail_intervened"
 
 
 @pytest.mark.usefixtures("_clean_env")
@@ -4756,8 +4804,8 @@ class TestXecGuardStreamingResponses:
         assert not any(isinstance(c, bytes) for c in out)
 
     @pytest.mark.asyncio
-    async def test_a_scan_error_in_window_mode_still_fails_open(self):
-        gr = self._guardrail(block_on_error=True)
+    async def test_a_scan_error_in_window_mode_fails_open_when_block_on_error_is_off(self):
+        gr = self._guardrail(block_on_error=False)
         with patch.object(gr.async_handler, "post", side_effect=httpx.ConnectError("refused")):
             out = await _drain(
                 gr.async_post_call_streaming_iterator_hook(
@@ -4960,7 +5008,7 @@ class TestXecGuardStreamingOutcomeRecording:
 
     @pytest.mark.asyncio
     async def test_a_stream_whose_scans_all_failed_records_nothing(self):
-        gr = _stream_guardrail()
+        gr = _stream_guardrail(block_on_error=False)
         request_data = _meta_request_data()
         with patch.object(gr, "_call_scan", new=AsyncMock(return_value=None)):
             await _drain(

@@ -910,6 +910,29 @@ class XecGuardGuardrail(CustomGuardrail):
         )
 
     @staticmethod
+    def _unavailable_result() -> dict:
+        """What a stream scan that could not reach XecGuard stands for under ``block_on_error``.
+        A started stream cannot answer with an HTTP error, so it ends with a block like any other."""
+        return {
+            "decision": "UNSAFE",
+            "trace_id": "",
+            "xecguard_result": [
+                {
+                    "violated_policy_name": "XecGuardUnavailable",
+                    "rationale": "XecGuard API unreachable (block_on_error=True)",
+                }
+            ],
+        }
+
+    async def _stream_scan(self, messages: list[dict], request_data: dict, audit_only: bool) -> dict | None:
+        result: Final = await self._call_scan(
+            messages=messages, scan_type="response", request_data=request_data, suppress_errors=True
+        )
+        if result is None and self.block_on_error and not audit_only:
+            return self._unavailable_result()
+        return result
+
+    @staticmethod
     def _raw_size(chunk: Any) -> int:
         """Rough size of the reply text one stream event carries, used only to decide when a
         window is due; the exact text is read through litellm's translation at scan time."""
@@ -964,6 +987,13 @@ class XecGuardGuardrail(CustomGuardrail):
         flagged: Final[list[dict]] = []  # mutable-ok: audit hits collected while the stream runs
         outcome: Final[list[dict]] = []  # mutable-ok: last scan that came back, for the end-of-stream record
 
+        def note(result: dict | None) -> dict | None:
+            if result is not None and result.get("decision") == "SAFE":
+                outcome[:] = [result]
+            if result is not None and result.get("decision") == "UNSAFE" and audit_only:
+                flagged.append(result)
+            return result
+
         async def scan_tool_calls() -> dict | None:
             translation: Final = translations[0] if translations else None
             reply: Final = await self._stream_reply(translation, chunks)
@@ -972,14 +1002,7 @@ class XecGuardGuardrail(CustomGuardrail):
             messages: Final = self._reply_conversation(
                 self._request_turns(translation, request_data), self._assistant_turn("", reply.tool_calls)
             )
-            result: Final = await self._call_scan(
-                messages=messages, scan_type="response", request_data=request_data, suppress_errors=True
-            )
-            if result is not None:
-                outcome[:] = [result]
-                if result.get("decision") == "UNSAFE" and audit_only:
-                    flagged.append(result)
-            return result
+            return note(await self._stream_scan(messages, request_data, audit_only))
 
         async def scan_window() -> dict | None:
             translation: Final = translations[0] if translations else None
@@ -996,14 +1019,7 @@ class XecGuardGuardrail(CustomGuardrail):
             window: Final = overlap + new_text
             previous[0] += new_text
             messages: Final = self._reply_conversation(self._request_turns(translation, request_data), window)
-            result: Final = await self._call_scan(
-                messages=messages, scan_type="response", request_data=request_data, suppress_errors=True
-            )
-            if result is not None:
-                outcome[:] = [result]
-                if result.get("decision") == "UNSAFE" and audit_only:
-                    flagged.append(result)
-            return result
+            return note(await self._stream_scan(messages, request_data, audit_only))
 
         async for chunk in response:
             if not chunks:
@@ -1031,11 +1047,12 @@ class XecGuardGuardrail(CustomGuardrail):
             del held[:tail_start]
 
         result = await scan_window() if len(chunks) > scanned[0] else None
-        tool_result: Final = None if result is not None and result.get("decision") == "UNSAFE" else await scan_tool_calls()
+        scan_blocked: Final = result is not None and result.get("decision") == "UNSAFE"
+        tool_result: Final = None if scan_blocked else await scan_tool_calls()
         blocking = next((r for r in (result, tool_result) if r is not None and r.get("decision") == "UNSAFE"), None)
         if blocking is None:
             grounding_result = await self._stream_grounding(
-                request_data, translations[0] if translations else None, previous[0]
+                request_data, translations[0] if translations else None, previous[0], audit_only
             )
             if grounding_result is not None and audit_only:
                 flagged.append(grounding_result)
@@ -1086,9 +1103,7 @@ class XecGuardGuardrail(CustomGuardrail):
             xg_messages: Final = self._reply_conversation(
                 self._request_turns(translation, request_data), self._assistant_turn(reply.text, reply.tool_calls)
             )
-            scan_result: Final = await self._call_scan(
-                messages=xg_messages, scan_type="response", request_data=request_data
-            )
+            scan_result: Final = await self._stream_scan(xg_messages, request_data, audit_only=False)
             if scan_result is not None and scan_result.get("decision") == "UNSAFE":
                 self._record_block(request_data, scan_result, GuardrailEventHooks.post_call)
                 for event in self._block_events(scan_result, request_data, route, []):
@@ -1371,7 +1386,7 @@ class XecGuardGuardrail(CustomGuardrail):
         )
 
     async def _stream_grounding(
-        self, request_data: dict, translation: "BaseTranslation | None", reply_text: str
+        self, request_data: dict, translation: "BaseTranslation | None", reply_text: str, audit_only: bool = False
     ) -> dict | None:
         """Grounding check of a finished stream's reply, the way a plain response gets one.
         Only a reply with text can be grounded, so a tool-call-only stream has nothing to check."""
@@ -1379,13 +1394,16 @@ class XecGuardGuardrail(CustomGuardrail):
         if not documents or not reply_text:
             return None
         messages: Final = self._reply_conversation(self._request_turns(translation, request_data), reply_text)
-        result: Final = await self._call_grounding(messages=messages, documents=documents)
+        result: Final = await self._call_grounding(messages=messages, documents=documents, suppress_errors=True)
+        if result is None and self.block_on_error and not audit_only:
+            return self._unavailable_result()
         return result if result is not None and result.get("decision") == "UNSAFE" else None
 
     async def _call_grounding(
         self,
         messages: list[dict],
         documents: list[dict],
+        suppress_errors: bool = False,
     ) -> dict | None:
         prompt: Final = self._extract_last_text_by_role(messages, "user")
         response_text: Final = self._extract_last_text_by_role(messages, "assistant")
@@ -1398,7 +1416,7 @@ class XecGuardGuardrail(CustomGuardrail):
             "documents": documents,
             "strictness": self.grounding_strictness,
         }
-        return await self._post(path=_GROUNDING_ENDPOINT, payload=payload)
+        return await self._post(path=_GROUNDING_ENDPOINT, payload=payload, suppress_errors=suppress_errors)
 
     async def _post(
         self,
