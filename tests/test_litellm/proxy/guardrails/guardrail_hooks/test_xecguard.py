@@ -4019,6 +4019,157 @@ class TestXecGuardStructuredMessages:
         assert sent == [*FULL_CONVERSATION, {"role": "assistant", "content": "OK"}]
 
 
+TOOL_CALL = {"id": "call-1", "type": "function", "function": {"name": "ls", "arguments": '{"path": "/"}'}}
+TOOL_CONVERSATION = [
+    {"role": "system", "content": SYSTEM_PROMPT},
+    {"role": "user", "content": "list files"},
+    {"role": "assistant", "content": None, "tool_calls": [TOOL_CALL]},
+    {"role": "tool", "tool_call_id": "call-1", "content": "a.txt"},
+]
+
+
+@pytest.mark.usefixtures("_clean_env")
+class TestXecGuardToolCalls:
+    """A tool conversation reaches XecGuard in the OpenAI shape it routes ToolUse_Guard on."""
+
+    @pytest.mark.asyncio
+    async def test_a_tool_call_and_its_result_keep_their_ids_in_the_request_scan(self):
+        sent = await _sent_messages(
+            _extension_guardrail(),
+            {},
+            {"texts": ["list files", "a.txt"], "structured_messages": TOOL_CONVERSATION},
+        )
+        assert sent == TOOL_CONVERSATION
+
+    @pytest.mark.asyncio
+    async def test_a_conversation_ending_on_a_tool_result_is_not_rewritten_as_a_user_turn(self):
+        sent = await _sent_messages(
+            _extension_guardrail(),
+            {},
+            {"texts": ["list files", "a.txt"], "structured_messages": TOOL_CONVERSATION},
+        )
+        assert sent[-1] == {"role": "tool", "tool_call_id": "call-1", "content": "a.txt"}
+
+    @pytest.mark.asyncio
+    async def test_a_reply_that_only_calls_a_tool_is_scanned_as_that_call(self):
+        body = {"messages": FULL_CONVERSATION}
+        sent = await _sent_messages(_extension_guardrail(), body, {"tool_calls": [TOOL_CALL]}, "response")
+        assert sent == [*FULL_CONVERSATION, {"role": "assistant", "content": None, "tool_calls": [TOOL_CALL]}]
+
+    @pytest.mark.asyncio
+    async def test_a_reply_with_text_and_a_tool_call_carries_both_on_one_turn(self):
+        body = {"messages": FULL_CONVERSATION}
+        sent = await _sent_messages(
+            _extension_guardrail(), body, {"texts": ["checking"], "tool_calls": [TOOL_CALL]}, "response"
+        )
+        assert sent[-1] == {"role": "assistant", "content": "checking", "tool_calls": [TOOL_CALL]}
+
+    @pytest.mark.asyncio
+    async def test_a_reply_with_neither_text_nor_a_tool_call_is_not_scanned(self):
+        body = {"messages": FULL_CONVERSATION}
+        assert await _sent_messages(_extension_guardrail(), body, {"texts": [], "tool_calls": []}, "response") is None
+
+    @pytest.mark.asyncio
+    async def test_a_chat_request_with_tool_turns_is_scanned_with_them_when_nothing_is_structured(self):
+        sent = await _sent_messages(_extension_guardrail(), {"messages": TOOL_CONVERSATION}, {"texts": ["a.txt"]})
+        assert sent == TOOL_CONVERSATION
+
+
+def _tool_call_stream_chunks() -> list:
+    from litellm.types.utils import ChatCompletionDeltaToolCall, Function
+
+    def chunk(tool_calls=None, finish=None):
+        return ModelResponseStream(
+            id="x",
+            model="m",
+            choices=[StreamingChoices(index=0, delta=Delta(tool_calls=tool_calls), finish_reason=finish)],
+        )
+
+    def call(name, arguments, call_id=None):
+        return [
+            ChatCompletionDeltaToolCall(
+                id=call_id, type="function", index=0, function=Function(name=name, arguments=arguments)
+            )
+        ]
+
+    return [
+        chunk(call("ls", "", "call-1")),
+        chunk(call(None, '{"path":')),
+        chunk(call(None, ' "/"}')),
+        chunk(finish="tool_calls"),
+    ]
+
+
+async def _chunks_as_stream(chunks: list):
+    for c in chunks:
+        yield c
+
+
+@pytest.mark.usefixtures("_clean_env")
+class TestXecGuardStreamedToolCalls:
+    @staticmethod
+    async def _run(gr, scan_result, chunks):
+        scan = AsyncMock(return_value=scan_result)
+        with patch.object(gr, "_call_scan", new=scan):
+            out = await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=_route_user("/chat/completions"),
+                    response=_chunks_as_stream(chunks),
+                    request_data={"model": "m", "messages": FULL_CONVERSATION},
+                )
+            )
+        return out, scan
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["window", "buffer"])
+    async def test_a_streamed_tool_call_is_scanned_whole_after_the_request(self, mode):
+        _, scan = await self._run(_stream_guardrail(stream_mode=mode), {"decision": "SAFE"}, _tool_call_stream_chunks())
+        sent = scan.call_args.kwargs["messages"]
+        assert sent[:-1] == FULL_CONVERSATION
+        assert sent[-1]["role"] == "assistant"
+        assert sent[-1]["tool_calls"][0]["function"] == {"name": "ls", "arguments": '{"path": "/"}'}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["window", "buffer"])
+    async def test_a_safe_tool_call_stream_is_delivered_unchanged(self, mode):
+        chunks = _tool_call_stream_chunks()
+        out, _ = await self._run(_stream_guardrail(stream_mode=mode), {"decision": "SAFE"}, chunks)
+        assert out == chunks
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["window", "buffer"])
+    async def test_an_unsafe_tool_call_ends_the_stream_with_a_block(self, mode):
+        out, _ = await self._run(_stream_guardrail(stream_mode=mode), UNSAFE_SCAN, _tool_call_stream_chunks())
+        text = _block_text([e for e in out if isinstance(e, bytes)])
+        assert "[Blocked by XecGuard]" in text and "content_filter" in text
+
+    @pytest.mark.asyncio
+    async def test_audit_mode_flags_an_unsafe_tool_call_without_blocking(self):
+        chunks = _tool_call_stream_chunks()
+        request_data = {"model": "m", "messages": FULL_CONVERSATION}
+        gr = _stream_guardrail(stream_mode="audit")
+        with patch.object(gr, "_call_scan", new=AsyncMock(return_value=UNSAFE_SCAN)):
+            out = await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=_route_user("/chat/completions"),
+                    response=_chunks_as_stream(chunks),
+                    request_data=request_data,
+                )
+            )
+        assert out == chunks
+        assert _slg_entries(request_data)[0]["guardrail_status"] == "guardrail_flagged"
+
+    @pytest.mark.asyncio
+    async def test_a_stream_with_no_tool_call_adds_no_extra_scan(self):
+        _, scan = await self._run(
+            _stream_guardrail(stream_chunk=1000),
+            {"decision": "SAFE"},
+            [_stream_chunk("hello"), _stream_chunk("", finish_reason="stop")],
+        )
+        assert scan.await_count == 1
+
+
+
 @pytest.mark.usefixtures("_clean_env")
 class TestXecGuardSkipSystemWarning:
     """A framework flag can strip the system prompt out of structured_messages;

@@ -241,6 +241,7 @@ class _TextCapture(CustomGuardrail):
     def __init__(self) -> None:
         super().__init__(guardrail_name="xecguard-text-capture")
         self.text = ""
+        self.tool_calls: list = []
 
     async def apply_guardrail(
         self,
@@ -250,6 +251,7 @@ class _TextCapture(CustomGuardrail):
         logging_obj: Optional["LiteLLMLoggingObj"] = None,
     ) -> GenericGuardrailAPIInputs:
         self.text = "\n".join(t for t in inputs.get("texts") or () if t)
+        self.tool_calls = list(inputs.get("tool_calls") or ())
         return inputs
 
 
@@ -713,8 +715,8 @@ class XecGuardGuardrail(CustomGuardrail):
                 )
             except Exception as exc:
                 verbose_proxy_logger.debug("XecGuard logging_only: could not read the reply: %s", exc)
-        if capture.text:
-            return [*turns, {"role": "assistant", "content": capture.text}], "response"
+        if capture.text or capture.tool_calls:
+            return [*turns, self._assistant_turn(capture.text, capture.tool_calls)], "response"
         return (turns if turns and turns[-1].get("role") == "user" else []), "input"
 
     def logging_hook(
@@ -811,20 +813,28 @@ class XecGuardGuardrail(CustomGuardrail):
             return None
 
     @classmethod
-    async def _stream_text(cls, translation: "BaseTranslation | None", chunks: Sequence[Any]) -> str:
-        """The reply text streamed so far, as litellm's translation for the route reads it.
+    async def _stream_reply(cls, translation: "BaseTranslation | None", chunks: Sequence[Any]) -> _TextCapture:
+        """The reply streamed so far, as litellm's translation for the route reads it.
 
-        The translation hands it to ``apply_guardrail`` as ``inputs.texts``; a capturing
-        guardrail takes it from there. Chunks are copied first because some translations
-        rewrite the list they are given.
+        The translation hands the text to ``apply_guardrail`` as ``inputs.texts`` and the tool
+        calls as ``inputs.tool_calls``; a capturing guardrail takes them from there. Chunks are
+        copied first because some translations rewrite the list they are given.
         """
-        if translation is None or not chunks:
-            return ""
         capture: Final = _TextCapture()
+        if translation is None or not chunks:
+            return capture
         await translation.process_output_streaming_response(
             responses_so_far=copy.deepcopy(list(chunks)), guardrail_to_apply=capture, request_data={}
         )
-        return capture.text
+        return capture
+
+    @classmethod
+    async def _stream_text(cls, translation: "BaseTranslation | None", chunks: Sequence[Any]) -> str:
+        return (await cls._stream_reply(translation, chunks)).text
+
+    @staticmethod
+    def _assistant_turn(text: str, tool_calls: Sequence[Any]) -> dict:
+        return {"role": "assistant", "content": text or None, **({"tool_calls": list(tool_calls)} if tool_calls else {})}
 
     def _block_events(
         self,
@@ -910,12 +920,12 @@ class XecGuardGuardrail(CustomGuardrail):
         return 0
 
     @staticmethod
-    def _reply_conversation(turns: Sequence[dict], reply: str) -> list[dict]:
+    def _reply_conversation(turns: Sequence[dict], reply: str | dict) -> list[dict]:
         """The request turns followed by the reply. XecGuard rejects a scan with no user turn,
         so a route that exposes no request conversation (Gemini) gets a placeholder one."""
         has_user_turn: Final = any(t.get("role") == "user" and t.get("content") for t in turns)
         lead: Final = list(turns) if has_user_turn else [*turns, {"role": "user", "content": _NO_REQUEST_TEXT}]
-        return [*lead, {"role": "assistant", "content": reply}]
+        return [*lead, reply if isinstance(reply, dict) else {"role": "assistant", "content": reply}]
 
     def _held_tail_start(self, held: Sequence[Any]) -> int:
         """Index of the first withheld event to keep back after a SAFE window: the trailing
@@ -947,6 +957,23 @@ class XecGuardGuardrail(CustomGuardrail):
         released: Final[list[Any]] = []  # mutable-ok: events the client already holds
         flagged: Final[list[dict]] = []  # mutable-ok: audit hits collected while the stream runs
         outcome: Final[list[dict]] = []  # mutable-ok: last scan that came back, for the end-of-stream record
+
+        async def scan_tool_calls() -> dict | None:
+            translation: Final = translations[0] if translations else None
+            reply: Final = await self._stream_reply(translation, chunks)
+            if not reply.tool_calls:
+                return None
+            messages: Final = self._reply_conversation(
+                self._request_turns(translation, request_data), self._assistant_turn("", reply.tool_calls)
+            )
+            result: Final = await self._call_scan(
+                messages=messages, scan_type="response", request_data=request_data, suppress_errors=True
+            )
+            if result is not None:
+                outcome[:] = [result]
+                if result.get("decision") == "UNSAFE" and audit_only:
+                    flagged.append(result)
+            return result
 
         async def scan_window() -> dict | None:
             translation: Final = translations[0] if translations else None
@@ -998,9 +1025,13 @@ class XecGuardGuardrail(CustomGuardrail):
             del held[:tail_start]
 
         result = await scan_window() if len(chunks) > scanned[0] else None
-        if result is not None and result.get("decision") == "UNSAFE" and not audit_only:
-            self._record_block(request_data, result, GuardrailEventHooks.post_call)
-            for event in self._block_events(result, request_data, route, released):
+        tool_result: Final = None if result is not None and result.get("decision") == "UNSAFE" else await scan_tool_calls()
+        blocking: Final = next(
+            (r for r in (result, tool_result) if r is not None and r.get("decision") == "UNSAFE"), None
+        )
+        if blocking is not None and not audit_only:
+            self._record_block(request_data, blocking, GuardrailEventHooks.post_call)
+            for event in self._block_events(blocking, request_data, route, released):
                 yield event
             return
         self._record_stream_end(request_data, flagged, outcome[0] if outcome else None)
@@ -1039,9 +1070,11 @@ class XecGuardGuardrail(CustomGuardrail):
             all_chunks.append(chunk)
 
         translation: Final = self._translation_for_route(route, all_chunks[0] if all_chunks else None)
-        text: Final = await self._stream_text(translation, all_chunks)
-        if text:
-            xg_messages: Final = self._reply_conversation(self._request_turns(translation, request_data), text)
+        reply: Final = await self._stream_reply(translation, all_chunks)
+        if reply.text or reply.tool_calls:
+            xg_messages: Final = self._reply_conversation(
+                self._request_turns(translation, request_data), self._assistant_turn(reply.text, reply.tool_calls)
+            )
             scan_result: Final = await self._call_scan(
                 messages=xg_messages, scan_type="response", request_data=request_data
             )
@@ -1505,12 +1538,14 @@ class XecGuardGuardrail(CustomGuardrail):
         )
         texts: Final = self._join_input_texts(inputs)
         if input_type == "response":
-            if not texts:
+            tool_calls: Final = inputs.get("tool_calls")
+            if not texts and not tool_calls:
                 return []
-            return self._reply_conversation(turns, texts)
+            reply: Final = {"role": "assistant", "content": texts, **({"tool_calls": tool_calls} if tool_calls else {})}
+            return self._reply_conversation(turns, reply)
         if not turns and texts:
             return [{"role": "user", "content": texts}]
-        if not turns or turns[-1].get("role") == "user":
+        if not turns or turns[-1].get("role") in ("user", "tool"):
             return turns
         return [*turns, {"role": "user", "content": texts}] if texts else []
 
@@ -1543,8 +1578,11 @@ class XecGuardGuardrail(CustomGuardrail):
         """Flatten multimodal content to a plain string for XecGuard."""
         role: Final = message.get("role") or "user"
         content: Final = message.get("content")
+        tool_fields: Final = {
+            name: message[name] for name in ("tool_calls", "tool_call_id") if message.get(name) is not None
+        }
         if isinstance(content, str):
-            return {"role": role, "content": content}
+            return {"role": role, "content": content, **tool_fields}
         if isinstance(content, list):
             parts: Final[list[str]] = []
             for item in content:
@@ -1552,8 +1590,8 @@ class XecGuardGuardrail(CustomGuardrail):
                     text = item.get("text")
                     if isinstance(text, str):
                         parts.append(text)
-            return {"role": role, "content": "\n".join(parts)}
-        return {"role": role, "content": ""}
+            return {"role": role, "content": "\n".join(parts), **tool_fields}
+        return {"role": role, "content": None if tool_fields.get("tool_calls") else "", **tool_fields}
 
     @staticmethod
     def _extract_last_text_by_role(messages: list[dict], role: str) -> str | None:
