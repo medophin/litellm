@@ -234,6 +234,12 @@ def _sanitized_meta_text(text: str) -> str | None:
 _SSE_TEXT_FIELD = re.compile(r'"(?:text|partial_json)"\s*:\s*"((?:[^"\\]|\\.)*)"')
 
 
+def _tool_call_dict(tool_call: object) -> dict:
+    """A tool call as plain JSON. Some translations hand over pydantic objects rather than dicts."""
+    dumped: Final = tool_call.model_dump(exclude_none=True) if hasattr(tool_call, "model_dump") else tool_call
+    return dumped if isinstance(dumped, dict) else {}
+
+
 class _TextCapture(CustomGuardrail):
     """Takes the reply text a litellm translation hands to ``apply_guardrail`` and nothing
     else - how XecGuard reads a response with litellm's own per-endpoint parsing."""
@@ -251,7 +257,7 @@ class _TextCapture(CustomGuardrail):
         logging_obj: Optional["LiteLLMLoggingObj"] = None,
     ) -> GenericGuardrailAPIInputs:
         self.text = "\n".join(t for t in inputs.get("texts") or () if t)
-        self.tool_calls = list(inputs.get("tool_calls") or ())
+        self.tool_calls = [_tool_call_dict(call) for call in inputs.get("tool_calls") or ()]
         return inputs
 
 
@@ -1538,7 +1544,7 @@ class XecGuardGuardrail(CustomGuardrail):
         )
         texts: Final = self._join_input_texts(inputs)
         if input_type == "response":
-            tool_calls: Final = inputs.get("tool_calls")
+            tool_calls: Final = [_tool_call_dict(call) for call in inputs.get("tool_calls") or ()]
             if not texts and not tool_calls:
                 return []
             reply: Final = {"role": "assistant", "content": texts, **({"tool_calls": tool_calls} if tool_calls else {})}

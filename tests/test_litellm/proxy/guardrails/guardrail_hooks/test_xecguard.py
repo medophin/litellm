@@ -4065,6 +4065,21 @@ class TestXecGuardToolCalls:
         assert sent[-1] == {"role": "assistant", "content": "checking", "tool_calls": [TOOL_CALL]}
 
     @pytest.mark.asyncio
+    async def test_a_tool_call_object_is_sent_as_plain_json(self):
+        from litellm.types.utils import ChatCompletionMessageToolCall, Function
+
+        call = ChatCompletionMessageToolCall(id="call-1", type="function", function=Function(name="ls", arguments="{}"))
+        gr = _extension_guardrail()
+        with patch.object(gr.async_handler, "post", return_value=_make_response({"decision": "SAFE"})) as post:
+            await gr.apply_guardrail(
+                inputs={"tool_calls": [call]}, request_data={"messages": FULL_CONVERSATION}, input_type="response"
+            )
+        sent = json.loads(json.dumps(post.call_args.kwargs["json"]))
+        assert sent["messages"][-1]["tool_calls"] == [
+            {"id": "call-1", "type": "function", "function": {"name": "ls", "arguments": "{}"}}
+        ]
+
+    @pytest.mark.asyncio
     async def test_a_reply_with_neither_text_nor_a_tool_call_is_not_scanned(self):
         body = {"messages": FULL_CONVERSATION}
         assert await _sent_messages(_extension_guardrail(), body, {"texts": [], "tool_calls": []}, "response") is None
