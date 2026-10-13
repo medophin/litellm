@@ -70,7 +70,6 @@ from litellm.types.utils import (
     GuardrailStatus,
     GuardrailTracingDetail,
     ModelResponseStream,
-    StandardLoggingGuardrailInformation,
     StreamingChoices,
 )
 
@@ -651,49 +650,49 @@ class XecGuardGuardrail(CustomGuardrail):
         if not self._key_is_targeted(self._key_context(kwargs)):
             return kwargs, result
 
-        start_time: Final = datetime.now()
         try:
-            request_data: Final = {**kwargs}
+            scratch: Final = {**kwargs, "metadata": {}}
             scans: Final = await self._logged_call_scans(kwargs, result, call_type)
-            results: Final = await asyncio.gather(
-                *(
-                    self._call_scan(
-                        messages=messages, scan_type=scan_type, request_data=request_data, suppress_errors=True
-                    )
-                    for messages, scan_type in scans
-                )
+            await asyncio.gather(
+                *(self._record_logged_scan(scratch, messages, scan_type) for messages, scan_type in scans)
             )
-            answered: Final = [r for r in results if r is not None]
-            if not answered:
-                return kwargs, result
-            scan_result: Final = next((r for r in answered if r.get("decision") == "UNSAFE"), answered[0])
-
-            guardrail_status: Final[GuardrailStatus] = (
-                "guardrail_intervened" if scan_result.get("decision") == "UNSAFE" else "success"
-            )
-            end_time: Final = datetime.now()
-            slg: Final = StandardLoggingGuardrailInformation(
-                guardrail_name=self.guardrail_name or "xecguard",
-                guardrail_mode=GuardrailEventHooks.logging_only,
-                guardrail_response=_sanitize_scan_result_for_logging(scan_result),
-                guardrail_status=guardrail_status,
-                start_time=start_time.timestamp(),
-                end_time=end_time.timestamp(),
-                duration=(end_time - start_time).total_seconds(),
-                masked_entity_count=None,
-            )
-            existing: Final = kwargs["standard_logging_object"].get("guardrail_information")
-            if isinstance(existing, list):
-                existing.append(slg)
-            else:
-                kwargs["standard_logging_object"]["guardrail_information"] = [slg]
-
+            recorded: Final = scratch["metadata"].get("standard_logging_guardrail_information") or []
+            standard_logging_object: Final = kwargs.get("standard_logging_object")
+            if recorded and isinstance(standard_logging_object, dict):
+                existing: Final = standard_logging_object.get("guardrail_information")
+                standard_logging_object["guardrail_information"] = [
+                    *(existing if isinstance(existing, list) else ()),
+                    *recorded,
+                ]
         except Exception as exc:
             verbose_proxy_logger.debug(
                 "XecGuard logging_only swallowed exception: %s",
                 str(exc),
             )
         return kwargs, result
+
+    async def _record_logged_scan(self, scratch: dict, messages: list[dict], scan_type: str) -> None:
+        """One scan of a logged call, recorded the way every other mode records its scans. Observe
+        only: a failed scan records nothing and a violation is flagged, never raised."""
+        started: Final = datetime.now()
+        scan_result: Final = await self._call_scan(
+            messages=messages, scan_type=scan_type, request_data=scratch, suppress_errors=True
+        )
+        if scan_result is None:
+            return
+        violated: Final = scan_result.get("decision") == "UNSAFE"
+        self._record_scan_outcome(
+            request_data=scratch,
+            scan_result=scan_result,
+            event_type=GuardrailEventHooks.logging_only,
+            guardrail_status="guardrail_intervened" if violated else "success",
+            tracing_detail=GuardrailTracingDetail(
+                guardrail_action="BLOCKED" if violated else "ALLOWED",
+                violation_categories=list(self._violated_policy_names(scan_result)),
+            ),
+            start_time=started.timestamp(),
+            end_time=datetime.now().timestamp(),
+        )
 
     @staticmethod
     def _logged_reply_translation(result: Any, call_type: str) -> "BaseTranslation | None":
@@ -1765,6 +1764,8 @@ class XecGuardGuardrail(CustomGuardrail):
         event_type: GuardrailEventHooks,
         guardrail_status: GuardrailStatus,
         tracing_detail: GuardrailTracingDetail,
+        start_time: float | None = None,
+        end_time: float | None = None,
     ) -> None:
         self.add_standard_logging_guardrail_information_to_request_data(
             guardrail_json_response={
@@ -1775,6 +1776,9 @@ class XecGuardGuardrail(CustomGuardrail):
             guardrail_status=guardrail_status,
             event_type=event_type,
             tracing_detail=tracing_detail,
+            start_time=start_time,
+            end_time=end_time,
+            duration=end_time - start_time if start_time is not None and end_time is not None else None,
         )
 
     def _request_context(self, request_data: Mapping[str, Any], scan_result: dict) -> dict[str, Any]:

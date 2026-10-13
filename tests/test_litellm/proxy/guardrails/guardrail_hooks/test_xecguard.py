@@ -5460,37 +5460,54 @@ class TestXecGuardLoggingOnlyScansBothSides:
         assert sent["input"] == FULL_CONVERSATION
         assert sent["response"] == [*FULL_CONVERSATION, {"role": "assistant", "content": "OK"}]
 
-    @pytest.mark.asyncio
-    async def test_a_violation_in_the_request_is_recorded_though_the_reply_is_clean(self):
-        kwargs, result = self._logged()
-
+    @staticmethod
+    async def _recorded_by_side(unsafe_side):
         async def by_side(messages, scan_type, request_data=None, suppress_errors=False):
-            return UNSAFE_SCAN if scan_type == "input" else {"decision": "SAFE"}
+            return UNSAFE_SCAN if scan_type == unsafe_side else {"decision": "SAFE"}
 
+        from litellm.types.utils import Choices, Message, ModelResponse
+
+        kwargs = {"model": "m", "messages": FULL_CONVERSATION, "standard_logging_object": {}}
+        result = ModelResponse(choices=[Choices(index=0, message=Message(role="assistant", content="OK"))])
         gr = _extension_guardrail(event_hook="logging_only")
         with patch.object(gr, "_call_scan", new=by_side):
             await gr.async_logging_hook(kwargs=kwargs, result=result, call_type="acompletion")
-        (entry,) = kwargs["standard_logging_object"]["guardrail_information"]
-        assert entry["guardrail_status"] == "guardrail_intervened"
+        return kwargs["standard_logging_object"]["guardrail_information"]
 
     @pytest.mark.asyncio
-    async def test_a_violation_in_the_reply_is_recorded_though_the_request_is_clean(self):
-        kwargs, result = self._logged()
-
-        async def by_side(messages, scan_type, request_data=None, suppress_errors=False):
-            return UNSAFE_SCAN if scan_type == "response" else {"decision": "SAFE"}
-
-        gr = _extension_guardrail(event_hook="logging_only")
-        with patch.object(gr, "_call_scan", new=by_side):
-            await gr.async_logging_hook(kwargs=kwargs, result=result, call_type="acompletion")
-        (entry,) = kwargs["standard_logging_object"]["guardrail_information"]
-        assert entry["guardrail_status"] == "guardrail_intervened"
+    @pytest.mark.parametrize("unsafe_side", ["input", "response"])
+    async def test_each_scan_is_recorded_on_its_own_and_only_the_violating_one_is_flagged(self, unsafe_side):
+        entries = await self._recorded_by_side(unsafe_side)
+        statuses = sorted(e["guardrail_status"] for e in entries)
+        assert statuses == ["guardrail_intervened", "success"]
+        (flagged,) = [e for e in entries if e["guardrail_status"] == "guardrail_intervened"]
+        assert flagged["guardrail_action"] == "BLOCKED"
+        assert flagged["violation_categories"] == ["PolicyX"]
+        assert flagged["guardrail_mode"] == GuardrailEventHooks.logging_only
 
     @pytest.mark.asyncio
-    async def test_two_clean_scans_are_recorded_once_as_success(self):
+    async def test_a_violation_is_visible_without_the_response_body(self):
+        (flagged,) = [
+            e
+            for e in await self._recorded_by_side("input")
+            if e["guardrail_status"] == "guardrail_intervened"
+        ]
+        redacted = {k: v for k, v in flagged.items() if k != "guardrail_response"}
+        assert redacted["violation_categories"] == ["PolicyX"]
+        assert redacted["guardrail_action"] == "BLOCKED"
+
+    @pytest.mark.asyncio
+    async def test_a_recorded_scan_carries_its_timing_and_request_context(self):
+        entries = await self._recorded_by_side("input")
+        assert all(e["duration"] is not None and e["duration"] >= 0 for e in entries)
+        assert all("request_context" in e["guardrail_response"] for e in entries)
+
+    @pytest.mark.asyncio
+    async def test_two_clean_scans_are_recorded_as_two_successes(self):
         kwargs, result = self._logged()
         _, info = await self._run([{"decision": "SAFE"}] * 2, kwargs, result)
-        assert [e["guardrail_status"] for e in info] == ["success"]
+        assert [e["guardrail_status"] for e in info] == ["success", "success"]
+        assert all(e["guardrail_action"] == "ALLOWED" for e in info)
 
     @pytest.mark.asyncio
     async def test_one_failed_scan_still_records_the_other(self):
