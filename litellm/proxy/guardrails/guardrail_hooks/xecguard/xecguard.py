@@ -654,18 +654,19 @@ class XecGuardGuardrail(CustomGuardrail):
         start_time: Final = datetime.now()
         try:
             request_data: Final = {**kwargs}
-            messages, scan_type = await self._logged_call_history(kwargs, result, call_type)
-            if not messages:
-                return kwargs, result
-
-            scan_result: Final = await self._call_scan(
-                messages=messages,
-                scan_type=scan_type,
-                request_data=request_data,
-                suppress_errors=True,
+            scans: Final = await self._logged_call_scans(kwargs, result, call_type)
+            results: Final = await asyncio.gather(
+                *(
+                    self._call_scan(
+                        messages=messages, scan_type=scan_type, request_data=request_data, suppress_errors=True
+                    )
+                    for messages, scan_type in scans
+                )
             )
-            if scan_result is None:
+            answered: Final = [r for r in results if r is not None]
+            if not answered:
                 return kwargs, result
+            scan_result: Final = next((r for r in answered if r.get("decision") == "UNSAFE"), answered[0])
 
             guardrail_status: Final[GuardrailStatus] = (
                 "guardrail_intervened" if scan_result.get("decision") == "UNSAFE" else "success"
@@ -768,10 +769,13 @@ class XecGuardGuardrail(CustomGuardrail):
             return [{"role": "system", "content": system_prompt}, *request_turns]
         return request_turns
 
-    async def _logged_call_history(
+    async def _logged_call_scans(
         self, kwargs: dict, result: Any, call_type: str
-    ) -> tuple[list[dict], Literal["input", "response"]]:
-        """The logged request and, when there is one, its reply, both read by litellm's translations."""
+    ) -> list[tuple[list[dict], Literal["input", "response"]]]:
+        """The scans a logged call gets. A blocking mode sees the request in ``pre_call`` and the
+        reply in ``post_call``, so a logged call gets both: the request on its own as ``input``
+        (XecGuard judges the user side of the conversation only then), and the request with its
+        reply as ``response``. Both are read by litellm's translations."""
         from litellm.types.llms.openai import ResponseCompletedEvent
 
         turns: Final = self._logged_request_turns(kwargs, call_type)
@@ -785,9 +789,11 @@ class XecGuardGuardrail(CustomGuardrail):
                 )
             except Exception as exc:
                 verbose_proxy_logger.debug("XecGuard logging_only: could not read the reply: %s", exc)
+        request_scan: Final = [(turns, "input")] if turns and turns[-1].get("role") in ("user", "tool") else []
         if capture.text or capture.tool_calls:
-            return [*turns, self._assistant_turn(capture.text, capture.tool_calls)], "response"
-        return (turns if turns and turns[-1].get("role") in ("user", "tool") else []), "input"
+            assistant: Final = self._assistant_turn(capture.text, capture.tool_calls)
+            return [*request_scan, (self._reply_conversation(turns, assistant), "response")]
+        return request_scan
 
     def logging_hook(
         self,

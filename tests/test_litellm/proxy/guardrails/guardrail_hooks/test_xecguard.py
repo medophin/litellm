@@ -5432,6 +5432,85 @@ class TestXecGuardLoggingOnlyScansWhatTheOtherModesScan:
         assert sent["messages"][-1] == TOOL_CONVERSATION[3]
 
 
+@pytest.mark.usefixtures("_clean_env")
+class TestXecGuardLoggingOnlyScansBothSides:
+    """A logged call has its request and its reply in hand, so it gets the scans a blocking setup would
+    spend on two hooks: the request as ``input`` and the request with its reply as ``response``."""
+
+    @staticmethod
+    def _logged(result="OK"):
+        from litellm.types.utils import Choices, Message, ModelResponse
+
+        kwargs = {"model": "m", "messages": FULL_CONVERSATION, "standard_logging_object": {}}
+        return kwargs, ModelResponse(choices=[Choices(index=0, message=Message(role="assistant", content=result))])
+
+    @staticmethod
+    async def _run(decisions, kwargs, result, **gr_kwargs):
+        gr = _extension_guardrail(event_hook="logging_only", **gr_kwargs)
+        scan = AsyncMock(side_effect=decisions)
+        with patch.object(gr, "_call_scan", new=scan):
+            await gr.async_logging_hook(kwargs=kwargs, result=result, call_type="acompletion")
+        return scan, kwargs["standard_logging_object"].get("guardrail_information")
+
+    @pytest.mark.asyncio
+    async def test_the_request_and_the_reply_are_each_scanned(self):
+        kwargs, result = self._logged()
+        scan, _ = await self._run([{"decision": "SAFE"}] * 2, kwargs, result)
+        sent = {c.kwargs["scan_type"]: c.kwargs["messages"] for c in scan.call_args_list}
+        assert sent["input"] == FULL_CONVERSATION
+        assert sent["response"] == [*FULL_CONVERSATION, {"role": "assistant", "content": "OK"}]
+
+    @pytest.mark.asyncio
+    async def test_a_violation_in_the_request_is_recorded_though_the_reply_is_clean(self):
+        kwargs, result = self._logged()
+
+        async def by_side(messages, scan_type, request_data=None, suppress_errors=False):
+            return UNSAFE_SCAN if scan_type == "input" else {"decision": "SAFE"}
+
+        gr = _extension_guardrail(event_hook="logging_only")
+        with patch.object(gr, "_call_scan", new=by_side):
+            await gr.async_logging_hook(kwargs=kwargs, result=result, call_type="acompletion")
+        (entry,) = kwargs["standard_logging_object"]["guardrail_information"]
+        assert entry["guardrail_status"] == "guardrail_intervened"
+
+    @pytest.mark.asyncio
+    async def test_a_violation_in_the_reply_is_recorded_though_the_request_is_clean(self):
+        kwargs, result = self._logged()
+
+        async def by_side(messages, scan_type, request_data=None, suppress_errors=False):
+            return UNSAFE_SCAN if scan_type == "response" else {"decision": "SAFE"}
+
+        gr = _extension_guardrail(event_hook="logging_only")
+        with patch.object(gr, "_call_scan", new=by_side):
+            await gr.async_logging_hook(kwargs=kwargs, result=result, call_type="acompletion")
+        (entry,) = kwargs["standard_logging_object"]["guardrail_information"]
+        assert entry["guardrail_status"] == "guardrail_intervened"
+
+    @pytest.mark.asyncio
+    async def test_two_clean_scans_are_recorded_once_as_success(self):
+        kwargs, result = self._logged()
+        _, info = await self._run([{"decision": "SAFE"}] * 2, kwargs, result)
+        assert [e["guardrail_status"] for e in info] == ["success"]
+
+    @pytest.mark.asyncio
+    async def test_one_failed_scan_still_records_the_other(self):
+        kwargs, result = self._logged()
+        _, info = await self._run([None, UNSAFE_SCAN], kwargs, result)
+        assert [e["guardrail_status"] for e in info] == ["guardrail_intervened"]
+
+    @pytest.mark.asyncio
+    async def test_nothing_is_recorded_when_both_scans_fail(self):
+        kwargs, result = self._logged()
+        _, info = await self._run([None, None], kwargs, result)
+        assert info is None
+
+    @pytest.mark.asyncio
+    async def test_a_call_with_no_reply_text_is_scanned_once_as_its_request(self):
+        kwargs, _ = self._logged()
+        scan, _ = await self._run([{"decision": "SAFE"}], kwargs, None)
+        assert [c.kwargs["scan_type"] for c in scan.call_args_list] == ["input"]
+
+
 def test_anthropic_stream_stays_on_own_iterator_hook(xecguard_guardrail):
     """proxy/utils.py reroutes /v1/messages streams to the unified guardrail
     unless mask_response_content is set; xecguard must keep its own hook."""
