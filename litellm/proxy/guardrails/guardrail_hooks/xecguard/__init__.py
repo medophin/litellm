@@ -32,7 +32,7 @@ def initialize_guardrail(
         stream_mode=litellm_params.stream_mode or "window",
         stream_chunk=litellm_params.stream_chunk or 1200,
         stream_context=litellm_params.stream_context or 120,
-        stream_first=litellm_params.stream_first if litellm_params.stream_first is not None else True,
+        stream_first=litellm_params.stream_first if litellm_params.stream_first is not None else False,
         guardrail_name=guardrail.get(
             "guardrail_name",
             "",

@@ -188,7 +188,8 @@ class XecGuardConfigModel(GuardrailConfigModel):
         default=None,
         description=(
             "In 'window'/'audit' mode, whether each delta is released to the client "
-            "before it has been covered by a scan. Defaults to true."
+            "before it has been covered by a scan. Defaults to false: the newest events are held back "
+            "until a scan has covered them."
         ),
     )
 

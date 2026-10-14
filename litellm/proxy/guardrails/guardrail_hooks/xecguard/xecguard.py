@@ -285,7 +285,7 @@ class XecGuardGuardrail(CustomGuardrail):
         stream_mode: Literal["window", "buffer", "audit"] = "window",
         stream_chunk: int = 1200,
         stream_context: int = 120,
-        stream_first: bool = True,
+        stream_first: bool = False,
         **kwargs: Any,
     ) -> None:
         self.api_key = api_key or os.environ.get("XECGUARD_API_KEY")
@@ -853,8 +853,9 @@ class XecGuardGuardrail(CustomGuardrail):
 
         - ``window``: rolling-window scan every ``stream_chunk`` bytes
           (``stream_context`` overlap bytes + new text); UNSAFE cuts the
-          stream mid-flight. ``stream_first`` (default True) releases each
-          delta before it's covered by a scan (matches NeMo's default);
+          stream mid-flight. ``stream_first`` (default False) holds the
+          newest events back until a scan has covered them; True releases each
+          delta before it's covered by a scan (NeMo's behaviour);
           scan errors fail open (never block on a XecGuard outage).
         - ``buffer``: hold every event, scan the assembled text once, then
           replay the original events. Zero leak, no token-by-token feel. Scan

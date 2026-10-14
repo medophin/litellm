@@ -1914,7 +1914,7 @@ class TestXecGuardStreaming:
         assert xecguard_guardrail.stream_mode == "window"
         assert xecguard_guardrail.stream_chunk == 1200
         assert xecguard_guardrail.stream_context == 120
-        assert xecguard_guardrail.stream_first is True
+        assert xecguard_guardrail.stream_first is False
 
     def test_streaming_hook_is_own_override(self, xecguard_guardrail):
         """The dispatch classification in ``ProxyLogging._callback_capabilities``
@@ -2239,7 +2239,7 @@ class TestXecGuardInitializer:
         assert cb.stream_mode == "window"
         assert cb.stream_chunk == 1200
         assert cb.stream_context == 120
-        assert cb.stream_first is True
+        assert cb.stream_first is False
 
     def test_initializer_forwards_every_configurable_field(self):
         """The initializer names each param explicitly, so a field added to the
@@ -4719,7 +4719,7 @@ class TestXecGuardStreamingResponses:
 
     @pytest.mark.asyncio
     async def test_a_block_after_released_chunks_continues_the_open_response(self):
-        gr = self._guardrail()  # stream_first on: the first window is already with the client
+        gr = self._guardrail(stream_first=True)  # the first window is already with the client
         with patch.object(gr, "_call_scan", new=AsyncMock(return_value=UNSAFE_SCAN)):
             out = await _drain(
                 gr.async_post_call_streaming_iterator_hook(
@@ -5700,3 +5700,24 @@ class TestXecGuardLoggingOnlyIsSelectedLikeTheOtherModes:
         with patch.object(gr, "_call_scan", new=AsyncMock()) as scan:
             await gr.async_logging_hook(kwargs=kwargs, result=None, call_type="acompletion")
         scan.assert_not_awaited()
+
+
+class TestXecGuardStreamFirstDefault:
+    @pytest.mark.asyncio
+    async def test_by_default_nothing_reaches_the_client_before_the_first_scan_passes(self):
+        gr = _stream_guardrail(stream_chunk=6, stream_context=2)
+        released_before_scan: list[int] = []
+
+        async def scan(messages, scan_type, request_data=None, suppress_errors=False):
+            released_before_scan.append(len(released))
+            return UNSAFE_SCAN
+
+        released: list[object] = []
+        with patch.object(gr, "_call_scan", new=scan):
+            async for chunk in gr.async_post_call_streaming_iterator_hook(
+                user_api_key_dict=_route_user("/v1/chat/completions"),
+                response=_fake_stream(["secret", "more", "text"]),
+                request_data={"messages": [{"role": "user", "content": "hi"}], "model": "m"},
+            ):
+                released.append(chunk)
+        assert released_before_scan[0] == 0
