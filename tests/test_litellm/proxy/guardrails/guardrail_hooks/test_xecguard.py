@@ -5642,3 +5642,61 @@ def test_anthropic_stream_stays_on_own_iterator_hook(xecguard_guardrail):
     assert CallTypes.anthropic_messages in NON_OPENAI_STREAM_GUARDRAIL_TRANSLATION_CALL_TYPES
     assert xecguard_guardrail.mask_response_content is True
     assert getattr(xecguard_guardrail, "use_native_lifecycle_hooks", False) is not True
+
+
+class TestXecGuardLoggingOnlyIsSelectedLikeTheOtherModes:
+    """LiteLLM runs every logging_only guardrail on every request. XecGuard follows the same rule as its other
+    modes: default_on guardrails always run, any other only when the request names it."""
+
+    @staticmethod
+    def _call(metadata=None, **gr_kwargs):
+        gr = _extension_guardrail(event_hook="logging_only", **gr_kwargs)
+        data = {"model": "m", "litellm_params": {"metadata": metadata or {}}}
+        return gr.should_run_guardrail(data=data, event_type=GuardrailEventHooks.logging_only)
+
+    def test_default_on_runs_without_being_named(self):
+        assert self._call(default_on=True) is True
+
+    def test_not_default_on_and_not_named_does_not_run(self):
+        assert self._call(default_on=False) is False
+
+    def test_not_default_on_but_named_in_the_request_runs(self):
+        assert self._call({"guardrails": ["test-xecguard"]}, default_on=False) is True
+
+    def test_naming_another_guardrail_does_not_select_this_one(self):
+        assert self._call({"guardrails": ["something-else"]}, default_on=False) is False
+
+    def test_a_default_on_guardrail_still_honours_the_key_exclusion(self):
+        metadata = {"user_api_key_alias": "internal"}
+        assert self._call(metadata, default_on=True, except_aliases=["internal"]) is False
+
+    @pytest.mark.asyncio
+    async def test_runs_alongside_another_guardrails_record(self):
+        from litellm.types.utils import Choices, Message, ModelResponse
+
+        other = {"guardrail_name": "pii_stream_hold", "guardrail_status": "success"}
+        kwargs = {
+            "model": "m",
+            "messages": FULL_CONVERSATION,
+            "litellm_params": {"metadata": {"standard_logging_guardrail_information": [other]}},
+            "standard_logging_object": {},
+        }
+        result = ModelResponse(choices=[Choices(index=0, message=Message(role="assistant", content="OK"))])
+        gr = _extension_guardrail(event_hook="logging_only")
+        with patch.object(gr, "_call_scan", new=AsyncMock(return_value={"decision": "SAFE"})) as scan:
+            await gr.async_logging_hook(kwargs=kwargs, result=result, call_type="acompletion")
+        assert scan.await_count == 2
+        assert len(kwargs["standard_logging_object"]["guardrail_information"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_does_not_scan_twice_when_it_already_recorded(self):
+        mine = {"guardrail_name": "test-xecguard", "guardrail_status": "success"}
+        kwargs = {
+            "model": "m",
+            "messages": FULL_CONVERSATION,
+            "litellm_params": {"metadata": {"standard_logging_guardrail_information": [mine]}},
+        }
+        gr = _extension_guardrail(event_hook="logging_only")
+        with patch.object(gr, "_call_scan", new=AsyncMock()) as scan:
+            await gr.async_logging_hook(kwargs=kwargs, result=None, call_type="acompletion")
+        scan.assert_not_awaited()

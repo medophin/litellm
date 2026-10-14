@@ -495,7 +495,20 @@ class XecGuardGuardrail(CustomGuardrail):
         """
         if not super().should_run_guardrail(data, event_type):
             return False
+        if event_type == GuardrailEventHooks.logging_only and not self._selected_for_logging(data):
+            return False
         return self._key_is_targeted(self._key_context(data))
+
+    def _selected_for_logging(self, data: Mapping[str, Any]) -> bool:
+        """LiteLLM runs every logging_only guardrail on every request. Apply the rule the other modes
+        follow instead: a default_on guardrail always runs, any other only when the request names it."""
+        if self.default_on is True:
+            return True
+        nested: Final = data.get("litellm_params")
+        sources: Final = (data, nested) if isinstance(nested, dict) else (data,)
+        return any(
+            self._guardrail_is_in_requested_guardrails(self.get_guardrail_from_metadata(source)) for source in sources
+        )
 
     @log_guardrail_information
     async def apply_guardrail(
@@ -635,13 +648,7 @@ class XecGuardGuardrail(CustomGuardrail):
         StandardLoggingGuardrailInformation entry so the scan decision
         reaches downstream loggers (Langfuse, DataDog, etc.).
         """
-        if (
-            isinstance(kwargs, dict)
-            and "litellm_params" in kwargs
-            and "metadata" in kwargs["litellm_params"]
-            and "standard_logging_guardrail_information" in kwargs["litellm_params"]["metadata"]
-            and kwargs["litellm_params"]["metadata"]["standard_logging_guardrail_information"]
-        ):
+        if self._already_recorded(kwargs):
             return kwargs, result
 
         # Same key targeting as apply_guardrail. logging_only reaches the guardrail
@@ -670,6 +677,15 @@ class XecGuardGuardrail(CustomGuardrail):
                 str(exc),
             )
         return kwargs, result
+
+    def _already_recorded(self, kwargs: Mapping[str, Any]) -> bool:
+        litellm_params: Final = kwargs.get("litellm_params")
+        metadata: Final = litellm_params.get("metadata") if isinstance(litellm_params, dict) else None
+        recorded: Final = metadata.get("standard_logging_guardrail_information") if isinstance(metadata, dict) else None
+        return isinstance(recorded, list) and any(
+            isinstance(entry, dict) and entry.get("guardrail_name") == (self.guardrail_name or "xecguard")
+            for entry in recorded
+        )
 
     async def _record_logged_scan(self, scratch: dict, messages: list[dict], scan_type: str) -> None:
         """One scan of a logged call, recorded the way every other mode records its scans. Observe
