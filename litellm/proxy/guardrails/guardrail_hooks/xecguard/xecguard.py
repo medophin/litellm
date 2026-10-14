@@ -909,6 +909,13 @@ class XecGuardGuardrail(CustomGuardrail):
         return (await cls._stream_reply(translation, chunks)).text
 
     @staticmethod
+    def _text_after(scanned: str, read: str) -> str:
+        """The part of ``read`` that has not been scanned yet. A translation reads the events it is
+        handed, but the one that ends a Responses stream (``response.completed``) carries the whole
+        reply, so a slice that holds it reads back as the full text and not as the tail."""
+        return read[len(scanned) :] if scanned and read.startswith(scanned) else read
+
+    @staticmethod
     def _assistant_turn(text: str, tool_calls: Sequence[Any]) -> dict:
         calls: Final = {"tool_calls": list(tool_calls)} if tool_calls else {}
         return {"role": "assistant", "content": text or None, **calls}
@@ -1077,7 +1084,8 @@ class XecGuardGuardrail(CustomGuardrail):
 
         async def scan_window() -> dict | None:
             translation: Final = translations[0] if translations else None
-            new_text: Final = await self._stream_text(translation, chunks[scanned[0] :])
+            read: Final = await self._stream_text(translation, chunks[scanned[0] :])
+            new_text: Final = self._text_after(previous[0], read)
             scanned[0] = len(chunks)
             pending[0] = 0
             if not new_text:

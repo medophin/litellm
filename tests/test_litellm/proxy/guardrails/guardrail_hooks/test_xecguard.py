@@ -4169,6 +4169,111 @@ class TestXecGuardWindowReadsOnlyNewEvents:
         assert [c.kwargs["messages"][-1]["content"] for c in scan.call_args_list] == ["abc", "bcdef", "efgh"]
 
 
+REPLY_WORDS = ["Sure! ", "Here ", "is ", "it. ", "ID: ", "B234", "567", "890."]
+STREAMED_REPLY = "".join(REPLY_WORDS)
+
+
+def _sse_event(event: dict) -> bytes:
+    return f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode()
+
+
+def _reply_stream(route: str) -> list:
+    if route == "/chat/completions":
+        return [_stream_chunk(w) for w in REPLY_WORDS] + [_stream_chunk("", finish_reason="stop")]
+    if route == "/v1/responses":
+        from litellm.types.llms.openai import ResponseCompletedEvent
+
+        output = [
+            {
+                "type": "message",
+                "id": "msg_1",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": STREAMED_REPLY, "annotations": []}],
+            }
+        ]
+        completed = ResponseCompletedEvent(
+            type="response.completed",
+            response={
+                "id": "r",
+                "object": "response",
+                "created_at": 1,
+                "status": "completed",
+                "model": "m",
+                "output": output,
+            },
+        )
+        done = {
+            "type": "response.output_text.done",
+            "item_id": "msg_1",
+            "output_index": 0,
+            "content_index": 0,
+            "text": STREAMED_REPLY,
+        }
+        return [_created_event(), *(_responses_delta(w) for w in REPLY_WORDS), done, completed]
+    if route == "/v1/messages":
+        deltas = (
+            _sse_event({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": w}})
+            for w in REPLY_WORDS
+        )
+        return [
+            _sse_event({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+            *deltas,
+            _sse_event({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 1}}),
+            _sse_event({"type": "message_stop"}),
+        ]
+    return [
+        f"data: {json.dumps({'candidates': [{'content': {'parts': [{'text': w}], 'role': 'model'}, 'index': 0}]})}\n\n".encode()
+        for w in REPLY_WORDS
+    ]
+
+
+@pytest.mark.usefixtures("_clean_env")
+class TestXecGuardWindowsAreTheSameOnEveryRoute:
+    """A window is the new reply text with the overlap before it, whichever route streamed it. The
+    event that ends a Responses stream carries the whole reply, and it must not be scanned as new."""
+
+    ROUTES = ["/chat/completions", "/v1/responses", "/v1/messages", "/v1beta/models/gemini/gemini-2.5-flash:streamGenerateContent"]
+
+    @staticmethod
+    async def _windows(route, chunk, context):
+        gr = _stream_guardrail(stream_chunk=chunk, stream_context=context, stream_first=False)
+        scan = AsyncMock(return_value={"decision": "SAFE"})
+
+        async def stream():
+            for event in _reply_stream(route):
+                yield event
+
+        with patch.object(gr, "_call_scan", new=scan):
+            await _drain(
+                gr.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=_route_user(route),
+                    response=stream(),
+                    request_data={"model": "m", "messages": FULL_CONVERSATION},
+                )
+            )
+        return [c.kwargs["messages"][-1]["content"] for c in scan.call_args_list]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("route", ROUTES)
+    async def test_every_route_scans_the_same_windows(self, route):
+        assert await self._windows(route, 10, 4) == ["Sure! Here ", "ere is it. ID: ", "ID: B234567890."]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("route", ROUTES)
+    async def test_an_id_split_across_windows_is_scanned_whole_in_the_last_one(self, route):
+        windows = await self._windows(route, 5, 3)
+        assert windows[-1] == "234567890."
+        assert "B234" in windows[-2]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("route", ROUTES)
+    async def test_no_window_repeats_the_whole_reply(self, route):
+        windows = await self._windows(route, 10, 4)
+        assert all(STREAMED_REPLY not in w or w == STREAMED_REPLY for w in windows[:-1])
+        assert all(len(w) < len(STREAMED_REPLY) for w in windows)
+
+
 @pytest.mark.usefixtures("_clean_env")
 class TestXecGuardStreamedToolCalls:
     @staticmethod
