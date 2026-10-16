@@ -5721,3 +5721,80 @@ class TestXecGuardStreamFirstDefault:
             ):
                 released.append(chunk)
         assert released_before_scan[0] == 0
+
+
+class TestXecGuardReadsProxyMetadataFromEitherBucket:
+    """The proxy keeps its own fields in ``metadata`` on chat and in ``litellm_metadata`` on
+    ``/v1/responses`` and ``/v1/messages``, where ``metadata`` is the caller's. A caller-supplied
+    (or any non-empty) ``metadata`` must not hide the proxy's fields."""
+
+    ROUTE = "/v1/responses"
+
+    @staticmethod
+    def _responses(**buckets):
+        return {**RESPONSES_BODY, **buckets}
+
+    @pytest.mark.parametrize(
+        "buckets",
+        [
+            {"litellm_metadata": {"user_api_key_request_route": ROUTE}},
+            {"metadata": {"x_client_peer_ip": "127.0.0.1"}, "litellm_metadata": {"user_api_key_request_route": ROUTE}},
+            {"metadata": {}, "litellm_metadata": {"user_api_key_request_route": ROUTE}},
+        ],
+    )
+    def test_the_route_is_found_whichever_bucket_holds_it(self, buckets):
+        assert XecGuardGuardrail._request_route(buckets) == self.ROUTE
+
+    def test_a_route_the_caller_names_in_metadata_does_not_beat_the_proxys(self):
+        request_data = {
+            "metadata": {"user_api_key_request_route": "FAKE"},
+            "litellm_metadata": {"user_api_key_request_route": self.ROUTE},
+        }
+        assert XecGuardGuardrail._request_route(request_data) == self.ROUTE
+
+    def test_no_route_anywhere_is_none(self):
+        assert XecGuardGuardrail._request_route({"metadata": {"a": 1}, "litellm_metadata": {}}) is None
+
+    @pytest.mark.asyncio
+    async def test_the_reply_scan_still_carries_the_request_when_the_caller_sent_metadata(self):
+        gr = _extension_guardrail(event_hook="post_call")
+        request_data = self._responses(
+            metadata={"x_client_peer_ip": "127.0.0.1"},
+            litellm_metadata={"user_api_key_request_route": self.ROUTE},
+        )
+        sent = await _sent_messages(gr, request_data, {"texts": ["a reply"]}, input_type="response")
+        assert [m["role"] for m in sent] == ["system", "user", "assistant"]
+        assert sent[1]["content"] == USER_PROMPT
+
+    @pytest.mark.asyncio
+    async def test_custom_policies_follow_the_request_length_when_the_caller_sent_metadata(self):
+        gr = _extension_guardrail(
+            event_hook="post_call",
+            policy_names=["Base"],
+            custom_policy_names=["Custom"],
+            custom_policy_min_chars=5,
+        )
+        request_data = self._responses(
+            metadata={"x_client_peer_ip": "127.0.0.1"},
+            litellm_metadata={"user_api_key_request_route": self.ROUTE},
+        )
+        resp = _make_response({"decision": "SAFE"})
+        with patch.object(gr.async_handler, "post", return_value=resp) as mock_post:
+            await gr.apply_guardrail(inputs={"texts": ["a reply"]}, request_data=request_data, input_type="response")
+        assert "Custom" in mock_post.call_args.kwargs["json"]["policy_names"]
+
+    def test_the_block_log_names_the_caller_when_the_caller_sent_metadata(self):
+        request_data = {
+            "metadata": {"x_client_peer_ip": "127.0.0.1"},
+            "litellm_metadata": {"user_api_key_user_id": "u-1", "requester_ip_address": "10.0.0.9"},
+        }
+        fields = XecGuardGuardrail._block_log_fields(request_data, {"trace_id": "t"})
+        assert fields["user_id"] == "u-1"
+        assert fields["source_ip"] == "10.0.0.9"
+
+    def test_grounding_documents_are_found_in_either_bucket(self):
+        doc = {"document_id": "d1", "context": "text"}
+        key = "xecguard_grounding_documents"
+        assert XecGuardGuardrail._extract_grounding_documents({"litellm_metadata": {key: [doc]}})
+        assert XecGuardGuardrail._extract_grounding_documents({"metadata": {"other": 1}, "litellm_metadata": {key: [doc]}})
+        assert XecGuardGuardrail._extract_grounding_documents({"metadata": {key: [doc]}, "litellm_metadata": {"o": 1}})

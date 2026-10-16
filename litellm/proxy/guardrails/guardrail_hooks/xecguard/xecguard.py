@@ -225,6 +225,24 @@ _META_AUTO_DATA_FIELDS: Final[tuple[tuple[str, str], ...]] = (
 )
 
 
+_METADATA_BUCKETS: Final = ("litellm_metadata", "metadata")
+
+
+def _proxy_metadata_field(request_data: Mapping[str, Any], name: str) -> object:
+    """``name`` from the proxy's metadata, wherever the proxy put it.
+
+    Chat keeps its fields in ``metadata``; ``/v1/responses`` and ``/v1/messages`` keep them in
+    ``litellm_metadata`` and leave ``metadata`` to the caller, so the first bucket that is a dict
+    is not necessarily the one that has the field. ``litellm_metadata`` is read first: it is only
+    ever written by the proxy, while a caller can put any name into ``metadata``.
+    """
+    for bucket in _METADATA_BUCKETS:
+        candidate = request_data.get(bucket)
+        if isinstance(candidate, dict) and candidate.get(name) is not None:
+            return candidate[name]
+    return None
+
+
 def _sanitized_meta_text(text: str) -> str | None:
     """Strip control characters and cap the length, or None when nothing is left."""
     cleaned: Final = _META_CONTROL_CHARS.sub("", text)[:_META_MAX_VALUE_CHARS]
@@ -1608,11 +1626,7 @@ class XecGuardGuardrail(CustomGuardrail):
 
     @staticmethod
     def _request_route(request_data: Mapping[str, Any]) -> str | None:
-        md: Final = next(
-            (m for k in ("metadata", "litellm_metadata") if isinstance(m := request_data.get(k), dict)),
-            {},
-        )
-        route: Final = md.get("user_api_key_request_route")
+        route: Final = _proxy_metadata_field(request_data, "user_api_key_request_route")
         return route if isinstance(route, str) else None
 
     @staticmethod
@@ -1752,10 +1766,7 @@ class XecGuardGuardrail(CustomGuardrail):
 
     @staticmethod
     def _extract_grounding_documents(request_data: dict) -> list[dict]:
-        metadata: Final = request_data.get("metadata") or request_data.get("litellm_metadata")
-        if not isinstance(metadata, dict):
-            return []
-        raw_docs: Final = metadata.get(_METADATA_GROUNDING_KEY)
+        raw_docs: Final = _proxy_metadata_field(request_data, _METADATA_GROUNDING_KEY)
         if not isinstance(raw_docs, list) or not raw_docs:
             return []
         valid_docs: Final[list[dict]] = []
@@ -1815,18 +1826,18 @@ class XecGuardGuardrail(CustomGuardrail):
 
     @classmethod
     def _block_log_fields(cls, request_data: Mapping[str, Any], scan_result: dict) -> dict[str, Any]:
-        metadata: Final = cls._key_context(request_data) or {}
-        md: Final = next(
-            (m for k in ("metadata", "litellm_metadata") if isinstance(m := metadata.get(k), dict)),
-            {},
-        )
+        context: Final = cls._key_context(request_data) or {}
+
+        def proxy_field(name: str) -> object:
+            return _proxy_metadata_field(context, name)
+
         rationale: Final = next((v["rationale"] for v in cls._violations(scan_result) if v.get("rationale")), None)
         return {
             "request_id": request_data.get("litellm_call_id"),
-            "session_id": request_data.get("litellm_session_id") or md.get("session_id"),
-            "user_id": md.get("user_api_key_user_id"),
-            "source_ip": md.get("requester_ip_address"),
-            "user_agent": md.get("user_agent"),
+            "session_id": request_data.get("litellm_session_id") or proxy_field("session_id"),
+            "user_id": proxy_field("user_api_key_user_id"),
+            "source_ip": proxy_field("requester_ip_address"),
+            "user_agent": proxy_field("user_agent"),
             "trace_id": scan_result.get("trace_id"),
             "policies": cls._violated_policy_names(scan_result),
             "rationale": rationale,
