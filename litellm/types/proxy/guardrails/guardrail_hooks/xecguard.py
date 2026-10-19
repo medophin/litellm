@@ -42,8 +42,9 @@ class XecGuardConfigModel(GuardrailConfigModel):
             "XecGuard policies to apply on each scan. Select one or more "
             "of the built-in default policies; if none are selected, "
             "the guardrail defaults to System Prompt Enforcement, "
-            "Harmful Content Protection, General Prompt Attack Protection "
-            "and Tool Use Guard. "
+            "Harmful Content Protection and General Prompt Attack Protection. "
+            "Select Tool Use Guard explicitly to scan tool calls: XecGuard "
+            "rejects a conversation that contains tool calls without it. "
             "Only the text of a message is scanned: images and other non-text "
             "content are not sent to XecGuard."
         ),
