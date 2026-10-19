@@ -154,6 +154,7 @@ _DEFAULT_POLICIES: Final = [
     "Default_Policy_SystemPromptEnforcement",
     "Default_Policy_HarmfulContentProtection",
     "Default_Policy_GeneralPromptAttackProtection",
+    "Default_Policy_ToolUseGuard",
 ]
 
 # ``meta`` contract of POST /xecguard/v1/scan: an optional object carrying caller

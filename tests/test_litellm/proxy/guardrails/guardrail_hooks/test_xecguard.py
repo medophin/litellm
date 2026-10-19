@@ -1014,6 +1014,7 @@ class TestXecGuardCustomPolicyThreshold:
         "Default_Policy_SystemPromptEnforcement",
         "Default_Policy_HarmfulContentProtection",
         "Default_Policy_GeneralPromptAttackProtection",
+        "Default_Policy_ToolUseGuard",
     ]
 
     @staticmethod
@@ -2132,7 +2133,7 @@ class TestXecGuardConfigModel:
     def test_policy_names_exposes_multiselect_options(self):
         """The UI renders policy_names as a multiselect dropdown. Guard
         against accidental removal of the json_schema_extra metadata and
-        verify the six default policies are offered."""
+        verify the seven default policies are offered."""
         from litellm.types.proxy.guardrails.guardrail_hooks.xecguard import (
             XECGUARD_DEFAULT_POLICY_OPTIONS,
         )
@@ -2157,6 +2158,49 @@ class TestXecGuardConfigModel:
             "Default_Policy_PIISensitiveDataProtection"
             in XECGUARD_DEFAULT_POLICY_OPTIONS
         )
+        assert "Default_Policy_ToolUseGuard" in XECGUARD_DEFAULT_POLICY_OPTIONS
+
+
+class TestXecGuardToolUseGuardIsADefault:
+    """A guardrail with no policies configured scans tool calls too: XecGuard only judges a tool
+    call when ToolUseGuard is among the policies, and rejects the tool-call turns without it."""
+
+    TOOL_CALL = [{"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}]
+
+    @pytest.mark.asyncio
+    async def test_the_fallback_policies_include_tool_use_guard(self):
+        gr = XecGuardGuardrail(api_base="https://x", api_key="k", guardrail_name="t", event_hook="pre_call")
+        resp = _make_response({"decision": "SAFE"})
+        with patch.object(gr.async_handler, "post", return_value=resp) as mock_post:
+            await gr.apply_guardrail(inputs={"texts": ["hi"]}, request_data={"model": "m"}, input_type="request")
+        assert "Default_Policy_ToolUseGuard" in mock_post.call_args.kwargs["json"]["policy_names"]
+
+    @pytest.mark.asyncio
+    async def test_a_tool_call_reply_is_scanned_under_the_fallback_policies(self):
+        gr = XecGuardGuardrail(api_base="https://x", api_key="k", guardrail_name="t", event_hook="post_call")
+        resp = _make_response({"decision": "SAFE"})
+        with patch.object(gr.async_handler, "post", return_value=resp) as mock_post:
+            await gr.apply_guardrail(
+                inputs={"texts": [], "tool_calls": self.TOOL_CALL},
+                request_data={"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+                input_type="response",
+            )
+        body = mock_post.call_args.kwargs["json"]
+        assert body["scan_type"] == "response"
+        assert "Default_Policy_ToolUseGuard" in body["policy_names"]
+        assert body["messages"][-1]["tool_calls"][0]["function"]["name"] == "f"
+
+    def test_a_configured_policy_list_is_not_extended(self):
+        gr = XecGuardGuardrail(
+            api_base="https://x",
+            api_key="k",
+            guardrail_name="t",
+            event_hook="pre_call",
+            policy_names=["Default_Policy_PIISensitiveDataProtection"],
+        )
+        assert gr._resolve_policy_names([{"role": "user", "content": "hi"}]) == [
+            "Default_Policy_PIISensitiveDataProtection"
+        ]
 
 
 class TestXecGuardInitializer:

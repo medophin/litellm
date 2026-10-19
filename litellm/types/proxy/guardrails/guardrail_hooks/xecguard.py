@@ -11,6 +11,7 @@ XECGUARD_DEFAULT_POLICY_OPTIONS: Final = [
     "Default_Policy_HarmfulContentProtection",
     "Default_Policy_SkillsProtection",
     "Default_Policy_PIISensitiveDataProtection",
+    "Default_Policy_ToolUseGuard",
 ]
 
 
@@ -41,7 +42,8 @@ class XecGuardConfigModel(GuardrailConfigModel):
             "XecGuard policies to apply on each scan. Select one or more "
             "of the built-in default policies; if none are selected, "
             "the guardrail defaults to System Prompt Enforcement, "
-            "Harmful Content Protection and General Prompt Attack Protection. "
+            "Harmful Content Protection, General Prompt Attack Protection "
+            "and Tool Use Guard. "
             "Only the text of a message is scanned: images and other non-text "
             "content are not sent to XecGuard."
         ),
