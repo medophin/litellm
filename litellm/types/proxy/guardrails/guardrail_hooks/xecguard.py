@@ -196,6 +196,17 @@ class XecGuardConfigModel(GuardrailConfigModel):
         ),
     )
 
+    rationale_poll_seconds: float | None = Field(
+        default=None,
+        description=(
+            "XecGuard may answer a violation at once with a placeholder rationale and finish the real one later. "
+            "The request is never held for it: the block is returned immediately, then the real rationale is "
+            "fetched in the background for up to this many seconds and written to the proxy log and, when "
+            "`store_prompts_in_spend_logs` is on, to the spend log. Defaults to 120, 0 turns it off. "
+            "Needs a token that may read XecGuard traces."
+        ),
+    )
+
     @field_validator(
         "apply_to_aliases",
         "except_aliases",

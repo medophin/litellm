@@ -43,6 +43,7 @@ from datetime import datetime
 from functools import reduce
 from typing import TYPE_CHECKING, Any, Final, Literal, Optional, cast
 
+import httpx
 from fastapi.exceptions import HTTPException
 
 from litellm._logging import verbose_proxy_logger
@@ -62,6 +63,11 @@ from litellm.llms.custom_httpx.http_handler import (
 from litellm.proxy._types import (
     LiteLLM_ManagementEndpoint_MetadataFields,
     LiteLLM_ManagementEndpoint_MetadataFields_Premium,
+)
+from litellm.proxy.guardrails.guardrail_hooks.xecguard.rationale_backfill import (
+    has_pending_rationale,
+    start_backfill,
+    update_spend_log,
 )
 from litellm.types.guardrails import GuardrailEventHooks
 from litellm.types.utils import (
@@ -144,6 +150,9 @@ def _sanitize_scan_result_for_logging(scan_result: dict) -> dict:
 _DEFAULT_API_BASE: Final = "https://api-xecguard.cycraft.ai"
 _SCAN_ENDPOINT: Final = "/xecguard/v1/scan"
 _GROUNDING_ENDPOINT: Final = "/xecguard/v1/grounding"
+_TRACE_ENDPOINT: Final = "/xecguard/v1/trace"
+_DEFAULT_RATIONALE_POLL_SECONDS: Final = 120.0
+_TRACE_DENIED_STATUSES: Final = frozenset({401, 403})
 _NO_REQUEST_TEXT: Final = "(request text unavailable)"
 _DEFAULT_MODEL: Final = "xecguard_v2"
 _DEFAULT_CUSTOM_POLICY_MIN_CHARS: Final = 500
@@ -304,6 +313,7 @@ class XecGuardGuardrail(CustomGuardrail):
         stream_chunk: int = 1200,
         stream_context: int = 120,
         stream_first: bool = False,
+        rationale_poll_seconds: float | None = None,
         **kwargs: Any,
     ) -> None:
         self.api_key = api_key or os.environ.get("XECGUARD_API_KEY")
@@ -381,6 +391,9 @@ class XecGuardGuardrail(CustomGuardrail):
         self.stream_chunk = max(1, stream_chunk)
         self.stream_context = max(0, stream_context)
         self.stream_first = stream_first
+        self.rationale_poll_seconds = (
+            _DEFAULT_RATIONALE_POLL_SECONDS if rationale_poll_seconds is None else max(0.0, rationale_poll_seconds)
+        )
         self._warned_system_stripped = False
 
         self.async_handler = get_async_httpx_client(
@@ -1816,6 +1829,47 @@ class XecGuardGuardrail(CustomGuardrail):
             end_time=end_time,
             duration=end_time - start_time if start_time is not None and end_time is not None else None,
         )
+        self._backfill_rationale(request_data, scan_result)
+
+    def _backfill_rationale(self, request_data: Mapping[str, Any], scan_result: dict) -> None:
+        trace_id: Final = scan_result.get("trace_id")
+        if self.rationale_poll_seconds <= 0 or not isinstance(trace_id, str) or not trace_id:
+            return
+        if not has_pending_rationale(self._violations(scan_result)):
+            return
+        guardrail_name: Final = self.guardrail_name or "xecguard"
+        call_id: Final = request_data.get("litellm_call_id")
+        start_backfill(
+            fetch_trace=self._fetch_trace,
+            store_rationale=lambda request_id, rationales: update_spend_log(
+                guardrail_name, trace_id, request_id, rationales
+            ),
+            request_id=call_id if isinstance(call_id, str) else None,
+            trace_id=trace_id,
+            timeout_seconds=self.rationale_poll_seconds,
+            log_context={k: v for k, v in self._request_context(request_data, scan_result).items() if k != "rationale"},
+        )
+
+    async def _fetch_trace(self, trace_id: str) -> dict | None:
+        """The stored trace of a scan, or None while it cannot be read yet. A token that is not
+        allowed to read traces raises, since asking again cannot change that."""
+        try:
+            response: Final = await self.async_handler.get(
+                url=f"{self.api_base}{_TRACE_ENDPOINT}/{trace_id}",
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=10.0,
+            )
+            response.raise_for_status()
+            body: Final = response.json()
+            return body if isinstance(body, dict) else None
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in _TRACE_DENIED_STATUSES:
+                raise
+            verbose_proxy_logger.debug("XecGuard trace %s not readable yet: %s", trace_id, exc)
+            return None
+        except Exception as exc:
+            verbose_proxy_logger.debug("XecGuard trace %s fetch failed: %s", trace_id, exc)
+            return None
 
     def _request_context(self, request_data: Mapping[str, Any], scan_result: dict) -> dict[str, Any]:
         fields: Final = {

@@ -33,6 +33,7 @@ def initialize_guardrail(
         stream_chunk=litellm_params.stream_chunk or 1200,
         stream_context=litellm_params.stream_context or 120,
         stream_first=litellm_params.stream_first if litellm_params.stream_first is not None else False,
+        rationale_poll_seconds=litellm_params.rationale_poll_seconds,
         guardrail_name=guardrail.get(
             "guardrail_name",
             "",
