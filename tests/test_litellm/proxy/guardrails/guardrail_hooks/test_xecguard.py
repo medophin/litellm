@@ -5849,3 +5849,92 @@ class TestXecGuardReadsProxyMetadataFromEitherBucket:
         assert XecGuardGuardrail._extract_grounding_documents({"litellm_metadata": {key: [doc]}})
         assert XecGuardGuardrail._extract_grounding_documents({"metadata": {"other": 1}, "litellm_metadata": {key: [doc]}})
         assert XecGuardGuardrail._extract_grounding_documents({"metadata": {key: [doc]}, "litellm_metadata": {"o": 1}})
+
+
+SKIPPED_SYSTEM_PROMPT = {"policy_name": "Default_Policy_SystemPromptEnforcement", "reason": "no_system_prompt"}
+
+
+def _safe_scan(**fields) -> dict:
+    return {"decision": "SAFE", "trace_id": "t-skip", "xecguard_result": [], **fields}
+
+
+class TestXecGuardReportsPoliciesItSkipped:
+    @pytest.mark.asyncio
+    async def test_a_safe_scan_that_skipped_a_policy_is_recorded_and_warned(self, xecguard_guardrail, caplog):
+        request_data = {"litellm_call_id": "r1", "metadata": {}}
+        scan = _safe_scan(skipped_policies=[SKIPPED_SYSTEM_PROMPT])
+
+        with caplog.at_level("WARNING", logger="LiteLLM Proxy"):
+            xecguard_guardrail._record_scan_outcome(
+                request_data=request_data,
+                scan_result=scan,
+                event_type=GuardrailEventHooks.pre_call,
+                guardrail_status="success",
+                tracing_detail={"guardrail_action": "ALLOWED"},
+            )
+
+        entry = request_data["metadata"]["standard_logging_guardrail_information"][0]
+        assert entry["skipped_policies"] == [SKIPPED_SYSTEM_PROMPT]
+        assert entry["guardrail_action"] == "ALLOWED"
+        warning = next(r.getMessage() for r in caplog.records if "skipped policies" in r.getMessage())
+        assert "Default_Policy_SystemPromptEnforcement" in warning
+        assert "no_system_prompt" in warning
+        assert "t-skip" in warning
+
+    @pytest.mark.parametrize("skipped", [None, []])
+    def test_nothing_skipped_adds_no_field_and_no_warning(self, xecguard_guardrail, caplog, skipped):
+        request_data = {"litellm_call_id": "r1", "metadata": {}}
+
+        with caplog.at_level("WARNING", logger="LiteLLM Proxy"):
+            xecguard_guardrail._record_scan_outcome(
+                request_data=request_data,
+                scan_result=_safe_scan(skipped_policies=skipped),
+                event_type=GuardrailEventHooks.pre_call,
+                guardrail_status="success",
+                tracing_detail={"guardrail_action": "ALLOWED"},
+            )
+
+        entry = request_data["metadata"]["standard_logging_guardrail_information"][0]
+        assert "skipped_policies" not in entry
+        assert not [r for r in caplog.records if "skipped policies" in r.getMessage()]
+
+    def test_a_block_records_the_skipped_policies_too(self, xecguard_guardrail):
+        request_data = {"litellm_call_id": "r1", "metadata": {}}
+        scan = {
+            "decision": "UNSAFE",
+            "trace_id": "t-skip",
+            "xecguard_result": [{"violated_policy_name": "Default_Policy_GeneralPromptAttackProtection"}],
+            "skipped_policies": [SKIPPED_SYSTEM_PROMPT],
+        }
+
+        xecguard_guardrail._record_block(request_data, scan, GuardrailEventHooks.pre_call)
+
+        entry = request_data["metadata"]["standard_logging_guardrail_information"][0]
+        assert entry["skipped_policies"] == [SKIPPED_SYSTEM_PROMPT]
+        assert entry["guardrail_action"] == "BLOCKED"
+
+    def test_the_field_survives_spend_log_redaction(self, xecguard_guardrail):
+        from litellm.proxy.spend_tracking.spend_tracking_utils import (
+            _sanitize_guardrail_information_for_spend_logs,
+        )
+
+        request_data = {"litellm_call_id": "r1", "metadata": {}}
+        xecguard_guardrail._record_scan_outcome(
+            request_data=request_data,
+            scan_result=_safe_scan(skipped_policies=[SKIPPED_SYSTEM_PROMPT]),
+            event_type=GuardrailEventHooks.pre_call,
+            guardrail_status="success",
+            tracing_detail={"guardrail_action": "ALLOWED"},
+        )
+
+        stored = _sanitize_guardrail_information_for_spend_logs(
+            request_data["metadata"]["standard_logging_guardrail_information"]
+        )
+
+        assert stored[0]["guardrail_response"] == "REDACTED_BY_LITELM"
+        assert stored[0]["skipped_policies"] == [SKIPPED_SYSTEM_PROMPT]
+
+    def test_malformed_entries_are_ignored(self, xecguard_guardrail):
+        assert xecguard_guardrail._skipped_policies(
+            {"skipped_policies": [SKIPPED_SYSTEM_PROMPT, "oops", {"reason": "no_tool_call"}, None]}
+        ) == [SKIPPED_SYSTEM_PROMPT]

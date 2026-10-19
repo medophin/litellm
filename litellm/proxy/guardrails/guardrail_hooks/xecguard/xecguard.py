@@ -1816,6 +1816,16 @@ class XecGuardGuardrail(CustomGuardrail):
         start_time: float | None = None,
         end_time: float | None = None,
     ) -> None:
+        skipped: Final = self._skipped_policies(scan_result)
+        if skipped:
+            verbose_proxy_logger.warning(
+                "XecGuard skipped policies, nothing was checked for them: %s",
+                json.dumps(
+                    {**self._request_context(request_data, scan_result), "skipped_policies": skipped},
+                    ensure_ascii=False,
+                    default=str,
+                ),
+            )
         self.add_standard_logging_guardrail_information_to_request_data(
             guardrail_json_response={
                 **_sanitize_scan_result_for_logging(scan_result),
@@ -1824,7 +1834,9 @@ class XecGuardGuardrail(CustomGuardrail):
             request_data=request_data,
             guardrail_status=guardrail_status,
             event_type=event_type,
-            tracing_detail=tracing_detail,
+            tracing_detail=cast(GuardrailTracingDetail, {**tracing_detail, "skipped_policies": skipped})
+            if skipped
+            else tracing_detail,
             start_time=start_time,
             end_time=end_time,
             duration=end_time - start_time if start_time is not None and end_time is not None else None,
@@ -1870,6 +1882,18 @@ class XecGuardGuardrail(CustomGuardrail):
         except Exception as exc:
             verbose_proxy_logger.debug("XecGuard trace %s fetch failed: %s", trace_id, exc)
             return None
+
+    @staticmethod
+    def _skipped_policies(scan_result: Mapping[str, object]) -> list[dict[str, str]]:
+        """Policies XecGuard did not run, with why (``no_system_prompt``, ``no_tool_call``, ...).
+        ``null`` and an empty list both mean every requested policy ran."""
+        raw: Final = scan_result.get("skipped_policies")
+        items: Final[Sequence[object]] = raw if isinstance(raw, list) else ()
+        return [
+            {"policy_name": str(item.get("policy_name")), "reason": str(item.get("reason"))}
+            for item in items
+            if isinstance(item, dict) and item.get("policy_name")
+        ]
 
     def _request_context(self, request_data: Mapping[str, Any], scan_result: dict) -> dict[str, Any]:
         fields: Final = {
