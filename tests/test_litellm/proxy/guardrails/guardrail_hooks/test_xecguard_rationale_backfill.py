@@ -5,14 +5,22 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from litellm.proxy.guardrails.guardrail_hooks.xecguard import rationale_backfill
-from litellm.proxy.guardrails.guardrail_hooks.xecguard.rationale_backfill import (
-    backfill_rationale,
-    patch_spend_log_metadata,
-    poll_ready_rationales,
-    ready_rationales,
+from litellm.proxy.guardrails.guardrail_hooks.xecguard import xecguard as xecguard_module
+from litellm.proxy.guardrails.guardrail_hooks.xecguard.xecguard import (
+    XecGuardGuardrail,
 )
-from litellm.proxy.guardrails.guardrail_hooks.xecguard.xecguard import XecGuardGuardrail
+from litellm.proxy.guardrails.guardrail_hooks.xecguard.xecguard import (
+    _backfill_rationale as backfill_rationale,
+)
+from litellm.proxy.guardrails.guardrail_hooks.xecguard.xecguard import (
+    _patch_spend_log_metadata as patch_spend_log_metadata,
+)
+from litellm.proxy.guardrails.guardrail_hooks.xecguard.xecguard import (
+    _poll_ready_rationales as poll_ready_rationales,
+)
+from litellm.proxy.guardrails.guardrail_hooks.xecguard.xecguard import (
+    _ready_rationales as ready_rationales,
+)
 from litellm.types.guardrails import GuardrailEventHooks
 
 PLACEHOLDER = "Analysis in progress. The detailed rationale for this violation will be available shortly."
@@ -187,7 +195,7 @@ class TestBackfillRationale:
     @pytest.mark.asyncio
     async def test_without_a_request_id_only_the_log_line_is_written(self):
         store = AsyncMock(return_value=True)
-        with patch.object(rationale_backfill.verbose_proxy_logger, "info") as info:
+        with patch.object(xecguard_module.verbose_proxy_logger, "info") as info:
             await backfill_rationale(
                 fetch_trace=AsyncMock(return_value=_trace(_reason())),
                 store_rationale=store,
@@ -231,7 +239,7 @@ def _prisma_with_row(request_data: dict) -> MagicMock:
 
 
 async def _drain_background_tasks() -> None:
-    await asyncio.gather(*list(rationale_backfill._running))
+    await asyncio.gather(*list(xecguard_module._backfill_tasks))
 
 
 def _trace_response(status: int = 200, body: dict | None = None) -> httpx.Response:
@@ -310,7 +318,7 @@ class TestXecGuardBackfillsAPlaceholderRationale:
         guardrail.async_handler = MagicMock(get=AsyncMock())
         guardrail._record_block(_request_data(), _pending_scan(), GuardrailEventHooks.pre_call)
 
-        assert not rationale_backfill._running
+        assert not xecguard_module._backfill_tasks
         guardrail.async_handler.get.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -322,5 +330,5 @@ class TestXecGuardBackfillsAPlaceholderRationale:
 
         guardrail._record_block(_request_data(), ready_scan, GuardrailEventHooks.pre_call)
 
-        assert not rationale_backfill._running
+        assert not xecguard_module._backfill_tasks
         guardrail.async_handler.get.assert_not_awaited()
