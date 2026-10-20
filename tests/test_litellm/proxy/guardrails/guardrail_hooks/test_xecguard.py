@@ -10,6 +10,7 @@ import asyncio
 import inspect
 import json
 import os
+import time
 from collections.abc import AsyncGenerator
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -5912,3 +5913,100 @@ class TestXecGuardReportsPoliciesItSkipped:
         assert xecguard_guardrail._skipped_policies(
             {"skipped_policies": [SKIPPED_SYSTEM_PROMPT, "oops", {"reason": "no_tool_call"}, None]}
         ) == [SKIPPED_SYSTEM_PROMPT]
+class TestXecGuardRecordsHowLongTheScanTook:
+    @staticmethod
+    def _slow_xecguard(guardrail, decision: str = "SAFE", delay: float = 0.05):
+        async def slow_post(**kwargs):
+            await asyncio.sleep(delay)
+            response = MagicMock()
+            response.raise_for_status = MagicMock()
+            response.json = MagicMock(
+                return_value={"decision": decision, "trace_id": "t-time", "xecguard_result": [], "skipped_policies": None}
+            )
+            return response
+
+        guardrail.async_handler = MagicMock(post=slow_post)
+
+    @staticmethod
+    def _inputs() -> dict:
+        return {"texts": ["hello"]}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("input_type", ["request", "response"])
+    async def test_an_allowed_scan_records_when_it_started_and_ended(self, xecguard_guardrail, input_type):
+        self._slow_xecguard(xecguard_guardrail)
+        request_data = {
+            "litellm_call_id": "r1",
+            "messages": [{"role": "user", "content": "hello"}],
+            "metadata": {},
+        }
+
+        before = time.time()
+        await xecguard_guardrail.apply_guardrail(self._inputs(), request_data, input_type)
+        after = time.time()
+
+        entry = request_data["metadata"]["standard_logging_guardrail_information"][0]
+        assert before <= entry["start_time"] <= entry["end_time"] <= after
+        assert entry["duration"] == pytest.approx(entry["end_time"] - entry["start_time"])
+        assert entry["duration"] >= 0.05
+
+    @pytest.mark.asyncio
+    async def test_a_blocked_scan_records_its_time_too(self, xecguard_guardrail):
+        self._slow_xecguard(xecguard_guardrail, decision="UNSAFE")
+        request_data = {
+            "litellm_call_id": "r1",
+            "messages": [{"role": "user", "content": "hello"}],
+            "metadata": {},
+        }
+
+        with pytest.raises(HTTPException):
+            await xecguard_guardrail.apply_guardrail(self._inputs(), request_data, "request")
+
+        entry = request_data["metadata"]["standard_logging_guardrail_information"][0]
+        assert entry["guardrail_action"] == "BLOCKED"
+        assert entry["duration"] >= 0.05
+        assert entry["end_time"] > entry["start_time"] > 0
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_window_is_kept_over_the_scan_time(self, xecguard_guardrail):
+        self._slow_xecguard(xecguard_guardrail, delay=0)
+        scan = await xecguard_guardrail._call_scan(messages=[{"role": "user", "content": "hi"}], scan_type="input")
+        request_data = {"litellm_call_id": "r1", "metadata": {}}
+
+        xecguard_guardrail._record_scan_outcome(
+            request_data=request_data,
+            scan_result=scan,
+            event_type=GuardrailEventHooks.logging_only,
+            guardrail_status="success",
+            tracing_detail={"guardrail_action": "ALLOWED"},
+            start_time=100.0,
+            end_time=102.0,
+        )
+
+        entry = request_data["metadata"]["standard_logging_guardrail_information"][0]
+        assert (entry["start_time"], entry["end_time"], entry["duration"]) == (100.0, 102.0, 2.0)
+
+    def test_a_result_without_a_measured_window_records_no_time(self, xecguard_guardrail):
+        request_data = {"litellm_call_id": "r1", "metadata": {}}
+
+        xecguard_guardrail._record_scan_outcome(
+            request_data=request_data,
+            scan_result={"decision": "SAFE", "trace_id": "t", "xecguard_result": []},
+            event_type=GuardrailEventHooks.pre_call,
+            guardrail_status="success",
+            tracing_detail={"guardrail_action": "ALLOWED"},
+        )
+
+        entry = request_data["metadata"]["standard_logging_guardrail_information"][0]
+        assert entry["start_time"] is None and entry["duration"] is None
+
+    @pytest.mark.asyncio
+    async def test_the_timed_result_is_still_the_plain_answer_to_callers(self, xecguard_guardrail):
+        self._slow_xecguard(xecguard_guardrail, delay=0)
+
+        scan = await xecguard_guardrail._call_scan(messages=[{"role": "user", "content": "hi"}], scan_type="input")
+
+        assert scan == {"decision": "SAFE", "trace_id": "t-time", "xecguard_result": [], "skipped_policies": None}
+        assert json.loads(json.dumps(scan))["decision"] == "SAFE"
+
+

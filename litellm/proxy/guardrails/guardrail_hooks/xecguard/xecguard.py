@@ -38,6 +38,7 @@ import copy
 import json
 import os
 import re
+import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from functools import reduce
@@ -140,6 +141,20 @@ def _sanitize_scan_result_for_logging(scan_result: dict) -> dict:
     redacted: Final = redact_nested_match_and_regex_keys(without_secrets)
     masked: Final = mask_credentials_in_payload(redacted if isinstance(redacted, dict) else without_secrets)
     return masked if isinstance(masked, dict) else without_secrets
+
+
+class _TimedResult(dict):
+    """A XecGuard answer that remembers when its request started and ended, so the guardrail record
+    carries the real scan time whichever path (request, reply, stream window) made the call."""
+
+    started: float
+    ended: float
+
+
+def _scan_window(scan_result: Mapping[str, object]) -> tuple[float | None, float | None]:
+    if isinstance(scan_result, _TimedResult):
+        return scan_result.started, scan_result.ended
+    return None, None
 
 
 _DEFAULT_API_BASE: Final = "https://api-xecguard.cycraft.ai"
@@ -1722,6 +1737,7 @@ class XecGuardGuardrail(CustomGuardrail):
             list(payload.keys()),
         )
         try:
+            started: Final = time.time()
             response: Final = await self.async_handler.post(
                 url=endpoint,
                 headers={
@@ -1732,7 +1748,12 @@ class XecGuardGuardrail(CustomGuardrail):
                 timeout=10.0,
             )
             response.raise_for_status()
-            return response.json()
+            body: Final = response.json()
+            if not isinstance(body, dict):
+                return body
+            timed: Final = _TimedResult(body)
+            timed.started, timed.ended = started, time.time()
+            return timed
         except Exception as exc:
             verbose_proxy_logger.error("XecGuard API error: %s", str(exc))
             if suppress_errors:
@@ -1980,6 +2001,9 @@ class XecGuardGuardrail(CustomGuardrail):
         start_time: float | None = None,
         end_time: float | None = None,
     ) -> None:
+        scan_started, scan_ended = _scan_window(scan_result)
+        started: Final = scan_started if start_time is None else start_time
+        ended: Final = scan_ended if end_time is None else end_time
         skipped: Final = self._skipped_policies(scan_result)
         if skipped:
             verbose_proxy_logger.warning(
@@ -2001,9 +2025,9 @@ class XecGuardGuardrail(CustomGuardrail):
             tracing_detail=cast(GuardrailTracingDetail, {**tracing_detail, "skipped_policies": skipped})
             if skipped
             else tracing_detail,
-            start_time=start_time,
-            end_time=end_time,
-            duration=end_time - start_time if start_time is not None and end_time is not None else None,
+            start_time=started,
+            end_time=ended,
+            duration=ended - started if started is not None and ended is not None else None,
         )
         self._backfill_rationale(request_data, scan_result)
 
