@@ -157,6 +157,7 @@ def _scan_window(scan_result: Mapping[str, object]) -> tuple[float | None, float
     return None, None
 
 
+_LOGGED_SCAN_LABEL: Final = {"input": "request scan", "response": "response scan"}
 _DEFAULT_API_BASE: Final = "https://api-xecguard.cycraft.ai"
 _SCAN_ENDPOINT: Final = "/xecguard/v1/scan"
 _GROUNDING_ENDPOINT: Final = "/xecguard/v1/grounding"
@@ -945,6 +946,7 @@ class XecGuardGuardrail(CustomGuardrail):
             tracing_detail=GuardrailTracingDetail(
                 guardrail_action="BLOCKED" if violated else "ALLOWED",
                 violation_categories=list(self._violated_policy_names(scan_result)),
+                detection_method=_LOGGED_SCAN_LABEL[scan_type],
             ),
             start_time=started.timestamp(),
             end_time=datetime.now().timestamp(),
@@ -2025,7 +2027,7 @@ class XecGuardGuardrail(CustomGuardrail):
             event_type=event_type,
             tracing_detail=cast(
                 GuardrailTracingDetail,
-                {**tracing_detail, **self._skipped_tracing_detail(skipped)},
+                {**tracing_detail, **self._skipped_tracing_detail(skipped, tracing_detail.get("detection_method"))},
             )
             if skipped
             else tracing_detail,
@@ -2088,14 +2090,14 @@ class XecGuardGuardrail(CustomGuardrail):
         ]
 
     @staticmethod
-    def _skipped_tracing_detail(skipped: Sequence[Mapping[str, str]]) -> dict[str, object]:
+    def _skipped_tracing_detail(skipped: Sequence[Mapping[str, str]], scan_label: str | None) -> dict[str, object]:
         """The skipped policies in the fields the Logs page already draws: ``detection_method`` is
         the badge on the guardrail row and survives spend log redaction, ``classification`` is the
         panel that opens under it and is redacted unless prompts are stored."""
         labels: Final = tuple(f"{item['policy_name']} ({item['reason']})" for item in skipped)
         return {
             "skipped_policies": list(skipped),
-            "detection_method": f"skipped: {' | '.join(labels)}",
+            "detection_method": " | ".join(filter(None, (scan_label, f"skipped: {' | '.join(labels)}"))),
             "classification": {"category": "Skipped policies", "reason": "; ".join(labels)},
         }
 

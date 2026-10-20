@@ -6129,3 +6129,73 @@ class TestXecGuardRecordsHowLongTheScanTook:
         assert json.loads(json.dumps(scan))["decision"] == "SAFE"
 
 
+class TestXecGuardLoggingOnlyNamesWhichSideItScanned:
+    @staticmethod
+    async def _logged(skipped=None):
+        gr = _extension_guardrail(event_hook="logging_only")
+        body = {"decision": "SAFE", "trace_id": "t-side", "xecguard_result": [], "skipped_policies": skipped}
+        kwargs = {
+            "model": "m",
+            "messages": [{"role": "user", "content": "hello"}],
+            "standard_logging_object": {},
+        }
+        from litellm.types.utils import Choices, Message, ModelResponse
+
+        reply = ModelResponse(choices=[Choices(index=0, message=Message(role="assistant", content="an answer"))])
+        with patch.object(gr.async_handler, "post", return_value=_make_response(body)):
+            await gr.async_logging_hook(kwargs=kwargs, result=reply, call_type="acompletion")
+        return kwargs["standard_logging_object"]["guardrail_information"]
+
+    @pytest.mark.asyncio
+    async def test_each_of_the_two_records_says_whether_it_was_the_request_or_the_reply(self):
+        gr = _extension_guardrail(event_hook="logging_only")
+        sent: list[str] = []
+
+        async def scan(messages, scan_type, request_data=None, suppress_errors=False):
+            sent.append(scan_type)
+            return {"decision": "SAFE", "trace_id": f"t-{scan_type}", "xecguard_result": []}
+
+        from litellm.types.utils import Choices, Message, ModelResponse
+
+        reply = ModelResponse(choices=[Choices(index=0, message=Message(role="assistant", content="an answer"))])
+        kwargs = {"model": "m", "messages": [{"role": "user", "content": "hello"}], "standard_logging_object": {}}
+        with patch.object(gr, "_call_scan", new=scan):
+            await gr.async_logging_hook(kwargs=kwargs, result=reply, call_type="acompletion")
+
+        entries = kwargs["standard_logging_object"]["guardrail_information"]
+        label_of_scan = {e["guardrail_response"]["trace_id"]: e["detection_method"] for e in entries}
+        assert sorted(sent) == ["input", "response"]
+        assert label_of_scan == {"t-input": "request scan", "t-response": "response scan"}
+        assert {e["guardrail_name"] for e in entries} == {"test-xecguard"}
+        assert {e["guardrail_mode"] for e in entries} == {"logging_only"}
+
+    @pytest.mark.asyncio
+    async def test_a_skipped_policy_adds_to_the_label_instead_of_replacing_it(self):
+        entries = await self._logged(
+            skipped=[{"policy_name": "Default_Policy_ToolUseGuard", "reason": "no_tool_call"}]
+        )
+
+        assert sorted(e["detection_method"] for e in entries) == [
+            "request scan | skipped: Default_Policy_ToolUseGuard (no_tool_call)",
+            "response scan | skipped: Default_Policy_ToolUseGuard (no_tool_call)",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_the_label_survives_the_default_spend_log_redaction(self):
+        from litellm.proxy.spend_tracking.spend_tracking_utils import (
+            _sanitize_guardrail_information_for_spend_logs,
+        )
+
+        stored = _sanitize_guardrail_information_for_spend_logs(await self._logged())
+
+        assert sorted(e["detection_method"] for e in stored) == ["request scan", "response scan"]
+        assert {e["guardrail_response"] for e in stored} == {"REDACTED_BY_LITELM"}
+
+    @pytest.mark.asyncio
+    async def test_a_blocking_mode_gets_no_scan_side_label(self, xecguard_guardrail):
+        request_data = {"litellm_call_id": "r1", "messages": [{"role": "user", "content": "hi"}], "metadata": {}}
+        with patch.object(xecguard_guardrail.async_handler, "post", return_value=_make_response({"decision": "SAFE"})):
+            await xecguard_guardrail.apply_guardrail({"texts": ["hi"]}, request_data, "request")
+
+        entry = request_data["metadata"]["standard_logging_guardrail_information"][0]
+        assert "detection_method" not in entry
