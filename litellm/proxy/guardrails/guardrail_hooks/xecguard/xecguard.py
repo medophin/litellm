@@ -1034,35 +1034,6 @@ class XecGuardGuardrail(CustomGuardrail):
             return [*request_scan, (self._reply_conversation(turns, assistant), "response")]
         return request_scan
 
-    def logging_hook(
-        self,
-        kwargs: dict,
-        result: Any,
-        call_type: str,
-    ) -> tuple[dict, Any]:
-        """Sync counterpart to ``async_logging_hook``.
-
-        Runs the async version on an available loop, swallowing every
-        exception. Mirrors the pattern used by the Presidio guardrail
-        for sync logging callbacks.
-        """
-        try:
-            try:
-                loop = asyncio.get_event_loop()
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-            if loop.is_running():
-                verbose_proxy_logger.debug("XecGuard sync logging_hook skipped: an event loop is already running")
-                return kwargs, result
-            loop.run_until_complete(self.async_logging_hook(kwargs=kwargs, result=result, call_type=call_type))
-        except Exception as exc:
-            verbose_proxy_logger.debug(
-                "XecGuard sync logging_hook swallowed exception: %s",
-                str(exc),
-            )
-        return kwargs, result
-
     # ------------------------------------------------------------------
     # Streaming (post_call): self-contained, does not use apply_guardrail
     # ------------------------------------------------------------------

@@ -6,6 +6,7 @@ branch coverage. Network calls are always mocked; the companion live
 suite lives in ``test_xecguard_live.py``.
 """
 
+import asyncio
 import inspect
 import json
 import os
@@ -1829,79 +1830,52 @@ class TestXecGuardLoggingHook:
                 assert out_kwargs is mock_request_data
                 assert out_result is result_obj
 
-    def test_sync_logging_hook_loop_running_returns_unchanged(
-        self, xecguard_guardrail, mock_request_data
-    ):
-        """When `asyncio.get_event_loop()` returns a running loop, the
-        hook returns without driving the async path."""
-        fake_loop = MagicMock()
-        fake_loop.is_running.return_value = True
-        with patch("asyncio.get_event_loop", return_value=fake_loop):
-            out = xecguard_guardrail.logging_hook(
-                kwargs=mock_request_data,
-                result=None,
-                call_type="acompletion",
+
+class TestXecGuardLoggingOnlyScansOncePerLoggedCall:
+    """LiteLLM runs the sync and the async logging hooks for one async request whenever any sync
+    callback is registered. Scanning from both sent the same request to XecGuard several times,
+    from worker threads whose event loops closed the shared connection under the main loop."""
+
+    @staticmethod
+    def _logged_kwargs() -> dict:
+        return {"model": "m", "messages": [{"role": "user", "content": "hello"}], "standard_logging_object": {}}
+
+    @staticmethod
+    def _reply():
+        from litellm.types.utils import Choices, Message, ModelResponse
+
+        return ModelResponse(choices=[Choices(index=0, message=Message(role="assistant", content="an answer"))])
+
+    def test_the_sync_hook_never_calls_xecguard_and_leaves_the_call_untouched(self):
+        gr = _extension_guardrail(event_hook="logging_only")
+        kwargs = self._logged_kwargs()
+        reply = self._reply()
+
+        with patch.object(gr.async_handler, "post") as post:
+            out = gr.logging_hook(kwargs=kwargs, result=reply, call_type="acompletion")
+
+        post.assert_not_called()
+        assert out == (kwargs, reply)
+        assert kwargs["standard_logging_object"] == {}
+
+    @pytest.mark.asyncio
+    async def test_both_hooks_for_one_call_send_exactly_one_scan_per_side(self):
+        """The sync hook runs on a LiteLLM worker thread, so it is called from one while the async hook
+        runs on the loop: both in flight for the same call, as they are in the proxy."""
+        gr = _extension_guardrail(event_hook="logging_only")
+        kwargs = self._logged_kwargs()
+        reply = self._reply()
+        body = {"decision": "SAFE", "trace_id": "t-once", "xecguard_result": []}
+
+        with patch.object(gr.async_handler, "post", return_value=_make_response(body)) as post:
+            await asyncio.gather(
+                asyncio.to_thread(gr.logging_hook, kwargs=kwargs, result=reply, call_type="acompletion"),
+                gr.async_logging_hook(kwargs=kwargs, result=reply, call_type="acompletion"),
             )
-        assert out == (mock_request_data, None)
-        fake_loop.run_until_complete.assert_not_called()
 
-    def test_sync_logging_hook_loop_not_running_drives_async(
-        self, xecguard_guardrail, mock_request_data
-    ):
-        """Idle loop path: run_until_complete is driven."""
-        fake_loop = MagicMock()
-        fake_loop.is_running.return_value = False
-        # Close the passed coroutine to silence the un-awaited-coroutine
-        # RuntimeWarning (MagicMock doesn't await it for us).
-        fake_loop.run_until_complete.side_effect = lambda coro: coro.close()
-        with patch("asyncio.get_event_loop", return_value=fake_loop):
-            out = xecguard_guardrail.logging_hook(
-                kwargs=mock_request_data,
-                result=None,
-                call_type="acompletion",
-            )
-        assert out[0] is mock_request_data
-        fake_loop.run_until_complete.assert_called_once()
-
-    def test_sync_logging_hook_runtime_error_creates_new_loop(
-        self, xecguard_guardrail, mock_request_data
-    ):
-        new_loop = MagicMock()
-        new_loop.is_running.return_value = False
-        new_loop.run_until_complete.side_effect = lambda coro: coro.close()
-        with patch(
-            "asyncio.get_event_loop",
-            side_effect=RuntimeError("no current event loop"),
-        ):
-            with patch("asyncio.new_event_loop", return_value=new_loop):
-                with patch("asyncio.set_event_loop") as mock_set:
-                    xecguard_guardrail.logging_hook(
-                        kwargs=mock_request_data,
-                        result=None,
-                        call_type="acompletion",
-                    )
-        new_loop.run_until_complete.assert_called_once()
-        mock_set.assert_called_once_with(new_loop)
-
-    def test_sync_logging_hook_swallows_outer_exception(
-        self, xecguard_guardrail, mock_request_data
-    ):
-        """If both get_event_loop and new_event_loop blow up, the outer
-        except swallows the error and returns kwargs, result."""
-        with patch(
-            "asyncio.get_event_loop",
-            side_effect=RuntimeError("no loop"),
-        ):
-            with patch(
-                "asyncio.new_event_loop",
-                side_effect=OSError("still broken"),
-            ):
-                out = xecguard_guardrail.logging_hook(
-                    kwargs=mock_request_data,
-                    result=None,
-                    call_type="acompletion",
-                )
-        assert out == (mock_request_data, None)
+        sent = sorted(call.kwargs["json"]["scan_type"] for call in post.call_args_list)
+        assert sent == ["input", "response"]
+        assert len(kwargs["standard_logging_object"]["guardrail_information"]) == 2
 
 
 # ---------------------------------------------------------------------------
