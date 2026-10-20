@@ -13,6 +13,12 @@ from litellm.proxy.guardrails.guardrail_hooks.xecguard.xecguard import (
     _backfill_rationale as backfill_rationale,
 )
 from litellm.proxy.guardrails.guardrail_hooks.xecguard.xecguard import (
+    _patch_error_information as patch_error_information,
+)
+from litellm.proxy.guardrails.guardrail_hooks.xecguard.xecguard import (
+    _patch_error_message as patch_error_message,
+)
+from litellm.proxy.guardrails.guardrail_hooks.xecguard.xecguard import (
     _patch_spend_log_metadata as patch_spend_log_metadata,
 )
 from litellm.proxy.guardrails.guardrail_hooks.xecguard.xecguard import (
@@ -167,6 +173,149 @@ class _FakeClock:
     async def sleep(self, seconds: float) -> None:
         self.waits.append(seconds)
         self.now += seconds
+
+
+OTHER_POLICY = "Default_Policy_HarmfulContentProtection"
+OTHER_REAL = "The prompt tries to extract internal information."
+BLOCK_MESSAGE = (
+    "400: {'error': 'Blocked by XecGuard: policies=[Default_Policy_HarmfulContentProtection,"
+    "Default_Policy_GeneralPromptAttackProtection] trace_id=t1 rationale=" + PLACEHOLDER + "', "
+    "'guardrail_name': 'g', 'xecguard_response': {'decision': 'UNSAFE', 'trace_id': 't1', 'xecguard_result': ["
+    "{'violated_policy_name': 'Default_Policy_HarmfulContentProtection', 'violated_rules_list': [], "
+    "'rationale': '" + PLACEHOLDER + "', 'rationale_status': 'ANALYSIS_REQUIRED', 'evidence_status': "
+    "'ANALYSIS_REQUIRED'}, {'violated_policy_name': 'Default_Policy_GeneralPromptAttackProtection', "
+    "'violated_rules_list': [], 'rationale': '" + PLACEHOLDER + "', 'rationale_status': 'ANALYSIS_REQUIRED', "
+    "'evidence_status': 'ANALYSIS_REQUIRED'}], 'truncation': None}, 'guardrail_mode': 'pre_call'}"
+)
+
+
+class TestPatchErrorMessage:
+    def test_every_placeholder_in_the_block_message_is_replaced_by_its_own_policys_rationale(self):
+        patched = patch_error_message(BLOCK_MESSAGE, "t1", {OTHER_POLICY: OTHER_REAL, POLICY: REAL})
+
+        assert patched is not None
+        assert PLACEHOLDER not in patched
+        assert f"trace_id=t1 rationale={OTHER_REAL}'" in patched
+        assert (
+            f"'violated_policy_name': 'Default_Policy_HarmfulContentProtection', 'violated_rules_list': [], 'rationale': '{OTHER_REAL}', 'rationale_status': 'READY'"
+            in patched
+        )
+        assert (
+            f"'violated_policy_name': '{POLICY}', 'violated_rules_list': [], 'rationale': '{REAL}', 'rationale_status': 'READY'"
+            in patched
+        )
+
+    def test_a_policy_without_a_ready_rationale_keeps_its_placeholder_and_status(self):
+        patched = patch_error_message(BLOCK_MESSAGE, "t1", {POLICY: REAL})
+
+        assert patched is not None
+        assert patched.count(PLACEHOLDER) == 1
+        assert patched.count("'rationale_status': 'READY'") == 1
+        assert patched.count("'rationale_status': 'ANALYSIS_REQUIRED'") == 1
+
+    def test_evidence_status_is_not_touched(self):
+        patched = patch_error_message(BLOCK_MESSAGE, "t1", {OTHER_POLICY: OTHER_REAL, POLICY: REAL})
+
+        assert patched is not None
+        assert patched.count("'evidence_status': 'ANALYSIS_REQUIRED'") == 2
+
+    def test_a_rationale_with_quotes_is_written_as_valid_python_repr(self):
+        quoted = 'It\'s an attempt to "bypass" the rules'
+        patched = patch_error_message(BLOCK_MESSAGE, "t1", {POLICY: quoted})
+
+        assert patched is not None
+        assert repr(quoted) in patched
+
+    def test_another_requests_message_is_left_alone(self):
+        assert patch_error_message(BLOCK_MESSAGE, "other-trace", {POLICY: REAL}) is None
+
+    def test_nothing_to_replace_means_no_change(self):
+        assert patch_error_message(BLOCK_MESSAGE, "t1", {}) is None
+        assert patch_error_message("400: something else trace_id=t1", "t1", {POLICY: REAL}) is None
+
+    def test_a_long_rationale_is_shortened_in_the_summary_like_the_client_message_was(self):
+        long_rationale = "x" * 500
+        patched = patch_error_message(BLOCK_MESSAGE, "t1", {OTHER_POLICY: long_rationale})
+
+        assert patched is not None
+        assert f"rationale={'x' * 200}'" in patched
+        assert "x" * 201 not in patched.split("'xecguard_response'")[0]
+
+
+class TestPatchErrorInformation:
+    @staticmethod
+    def _metadata(message: object = BLOCK_MESSAGE) -> dict:
+        return {"user_api_key_alias": "k", "error_information": {"error_code": "400", "error_message": message}}
+
+    def test_only_the_error_message_changes(self):
+        patched = patch_error_information(self._metadata(), "t1", {POLICY: REAL})
+
+        assert patched is not None
+        assert patched["user_api_key_alias"] == "k"
+        assert patched["error_information"]["error_code"] == "400"
+        assert REAL in patched["error_information"]["error_message"]
+
+    @pytest.mark.parametrize("metadata", [{}, {"error_information": None}, {"error_information": {"error_message": 5}}])
+    def test_no_usable_error_information_means_no_change(self, metadata):
+        assert patch_error_information(metadata, "t1", {POLICY: REAL}) is None
+
+
+class TestSpendLogUpdate:
+    @staticmethod
+    def _prisma(metadata: dict) -> MagicMock:
+        prisma = MagicMock()
+        prisma.db.query_raw = AsyncMock(return_value=[{"request_id": "rid-1", "metadata": json.dumps(metadata)}])
+        prisma.db.execute_raw = AsyncMock()
+        return prisma
+
+    @staticmethod
+    def _failed_row() -> dict:
+        return {
+            "error_information": {"error_message": BLOCK_MESSAGE},
+            "guardrail_information": [
+                {"guardrail_name": "g", "guardrail_response": "REDACTED_BY_LITELM", "guardrail_action": "BLOCKED"}
+            ],
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_error_message_gets_the_real_rationale_without_any_setting(self):
+        prisma = self._prisma(self._failed_row())
+
+        with (
+            patch("litellm.proxy.proxy_server.prisma_client", prisma),
+            patch.dict("litellm.proxy.proxy_server.general_settings", {"store_prompts_in_spend_logs": False}),
+        ):
+            stored = await xecguard_module._update_spend_log(
+                "g", "t1", "rid-1", {OTHER_POLICY: OTHER_REAL, POLICY: REAL}
+            )
+
+        assert stored is True
+        written = json.loads(prisma.db.execute_raw.await_args.args[2])
+        assert PLACEHOLDER not in written["error_information"]["error_message"]
+        assert written["guardrail_information"][0]["guardrail_response"] == "REDACTED_BY_LITELM"
+
+    @pytest.mark.asyncio
+    async def test_a_row_that_is_not_there_yet_is_asked_for_again(self):
+        prisma = self._prisma(self._failed_row())
+        prisma.db.query_raw = AsyncMock(return_value=[])
+
+        with patch("litellm.proxy.proxy_server.prisma_client", prisma):
+            stored = await xecguard_module._update_spend_log("g", "t1", "rid-1", {POLICY: REAL})
+
+        assert stored is False
+        prisma.db.execute_raw.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_row_with_nothing_of_ours_to_change_is_not_written(self):
+        prisma = self._prisma({"error_information": {"error_message": "400: unrelated"}})
+
+        with (
+            patch("litellm.proxy.proxy_server.prisma_client", prisma),
+            patch.dict("litellm.proxy.proxy_server.general_settings", {"store_prompts_in_spend_logs": False}),
+        ):
+            assert await xecguard_module._update_spend_log("g", "t1", "rid-1", {POLICY: REAL}) is True
+
+        prisma.db.execute_raw.assert_not_awaited()
 
 
 class TestPollBackoff:
@@ -355,12 +504,25 @@ class TestXecGuardBackfillsAPlaceholderRationale:
         await _drain_background_tasks()
 
     @pytest.mark.asyncio
-    async def test_redacted_spend_logs_are_not_queried_or_written(self):
+    async def test_without_prompt_storage_the_redacted_response_stays_redacted_and_the_error_is_filled(self):
         guardrail = _guardrail()
         guardrail.async_handler = MagicMock(get=AsyncMock(return_value=_trace_response(body=_trace(_reason()))))
         request_data = _request_data()
         guardrail._record_block(request_data, _pending_scan(), GuardrailEventHooks.pre_call)
-        prisma = _prisma_with_row(request_data)
+        stored = {
+            "guardrail_information": [
+                {
+                    "guardrail_name": "xecguard",
+                    "guardrail_response": "REDACTED_BY_LITELM",
+                    "guardrail_action": "BLOCKED",
+                }
+            ],
+            "error_information": {"error_message": BLOCK_MESSAGE},
+            "litellm_call_id": "rid-1",
+        }
+        prisma = MagicMock()
+        prisma.db.query_raw = AsyncMock(return_value=[{"request_id": "rid-1", "metadata": json.dumps(stored)}])
+        prisma.db.execute_raw = AsyncMock()
 
         with (
             patch("litellm.proxy.proxy_server.prisma_client", prisma),
@@ -368,8 +530,11 @@ class TestXecGuardBackfillsAPlaceholderRationale:
         ):
             await _drain_background_tasks()
 
-        prisma.db.query_raw.assert_not_awaited()
-        prisma.db.execute_raw.assert_not_awaited()
+        written = json.loads(prisma.db.execute_raw.await_args.args[2])
+        assert written["guardrail_information"][0]["guardrail_response"] == "REDACTED_BY_LITELM"
+        message = written["error_information"]["error_message"]
+        assert f"'violated_policy_name': '{POLICY}', 'violated_rules_list': [], 'rationale': '{REAL}'" in message
+        assert message.count(PLACEHOLDER) == 1
 
     @pytest.mark.asyncio
     async def test_a_token_that_cannot_read_traces_is_asked_once(self):

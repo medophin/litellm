@@ -365,6 +365,41 @@ def _is_scan_entry(entry: object, guardrail_name: str, trace_id: str) -> bool:
     return isinstance(response, Mapping) and response.get("trace_id") == trace_id
 
 
+def _patch_error_message(message: str, trace_id: str, rationales: Mapping[str, str]) -> str | None:
+    """``message`` with the placeholder rationales of this scan's block replaced, or None when it is not
+    that block or nothing in it changes. The message is the repr of the 400 the client got: the summary
+    after ``rationale=`` and each violation's own ``'rationale': '...'``, found by the policy named before it."""
+    if f"trace_id={trace_id}" not in message:
+        return None
+    patched = message
+    for policy, rationale in rationales.items():
+        pattern = re.compile(
+            r"(\{[^{}]*?'violated_policy_name': '" + re.escape(policy) + r"'[^{}]*?'rationale': )'[^']*'"
+            r"(, 'rationale_status': ')" + _RATIONALE_PENDING + "'"
+        )
+        patched = pattern.sub(lambda m: f"{m.group(1)}{rationale!r}{m.group(2)}{_RATIONALE_READY}'", patched)
+    first: Final = next(iter(rationales.values()), None)
+    if first is not None:
+        patched = re.sub(
+            r"(trace_id=" + re.escape(trace_id) + r" rationale=)[^']*(')",
+            lambda m: f"{m.group(1)}{first[:_RATIONALE_TRUNCATE_CHARS]}{m.group(2)}",
+            patched,
+            count=1,
+        )
+    return None if patched == message else patched
+
+
+def _patch_error_information(
+    metadata: Mapping[str, object], trace_id: str, rationales: Mapping[str, str]
+) -> dict[str, object] | None:
+    error: Final = metadata.get("error_information")
+    message: Final = error.get("error_message") if isinstance(error, Mapping) else None
+    if not isinstance(error, Mapping) or not isinstance(message, str):
+        return None
+    patched: Final = _patch_error_message(message, trace_id, rationales)
+    return None if patched is None else {**metadata, "error_information": {**error, "error_message": patched}}
+
+
 def _patch_entry(entry: object, trace_id: str, rationales: Mapping[str, str]) -> object:
     entry_map: Final = cast(Mapping[str, object], entry)
     response: Final = cast(Mapping[str, object], entry_map["guardrail_response"])
@@ -494,7 +529,7 @@ async def _update_spend_log(guardrail_name: str, trace_id: str, request_id: str,
     from litellm.proxy.proxy_server import prisma_client
     from litellm.proxy.spend_tracking.spend_tracking_utils import should_store_prompts_and_responses_in_spend_logs
 
-    if prisma_client is None or not should_store_prompts_and_responses_in_spend_logs():
+    if prisma_client is None:
         return True
     since: Final = (datetime.now(timezone.utc) - _SPEND_LOG_LOOKBACK).strftime("%Y-%m-%dT%H:%M:%S")
     rows: Final = await prisma_client.db.query_raw(_FIND_SPEND_LOG_SQL, request_id, since)
@@ -505,7 +540,13 @@ async def _update_spend_log(guardrail_name: str, trace_id: str, request_id: str,
     metadata: Final = json.loads(stored) if isinstance(stored, str) else stored
     if not isinstance(metadata, dict):
         return True
-    patched: Final = _patch_spend_log_metadata(metadata, guardrail_name, trace_id, rationales)
+    with_error: Final = _patch_error_information(metadata, trace_id, rationales) or metadata
+    with_entry: Final = (
+        _patch_spend_log_metadata(with_error, guardrail_name, trace_id, rationales)
+        if should_store_prompts_and_responses_in_spend_logs()
+        else None
+    )
+    patched: Final = with_entry or (with_error if with_error is not metadata else None)
     if patched is None:
         return True
     await prisma_client.db.execute_raw(_UPDATE_SPEND_LOG_SQL, row_id, json.dumps(patched, default=str))
