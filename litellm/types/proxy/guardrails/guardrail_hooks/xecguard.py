@@ -5,12 +5,14 @@ from pydantic import Field, field_validator
 from .base import GuardrailConfigModel
 
 XECGUARD_DEFAULT_POLICY_OPTIONS: Final = [
-    "Default_Policy_SystemPromptEnforcement",
     "Default_Policy_GeneralPromptAttackProtection",
+    "Default_Policy_SystemPromptEnforcement",
     "Default_Policy_ContentBiasProtection",
-    "Default_Policy_HarmfulContentProtection",
     "Default_Policy_SkillsProtection",
+    "Default_Policy_HarmfulContentProtection",
     "Default_Policy_PIISensitiveDataProtection",
+    "Default_Policy_ContextGroundingValidation",
+    "Default_Policy_OpenClaw_Detection",
     "Default_Policy_ToolUseGuard",
 ]
 
