@@ -161,6 +161,7 @@ _DEFAULT_API_BASE: Final = "https://api-xecguard.cycraft.ai"
 _SCAN_ENDPOINT: Final = "/xecguard/v1/scan"
 _GROUNDING_ENDPOINT: Final = "/xecguard/v1/grounding"
 _TRACE_ENDPOINT: Final = "/xecguard/v1/trace"
+_SKIPPED_POLICIES_HEADER: Final = "x-xecguard-skipped-policies"
 _DEFAULT_RATIONALE_POLL_SECONDS: Final = 120.0
 _TRACE_DENIED_STATUSES: Final = frozenset({401, 403})
 _NO_REQUEST_TEXT: Final = "(request text unavailable)"
@@ -2022,7 +2023,10 @@ class XecGuardGuardrail(CustomGuardrail):
             request_data=request_data,
             guardrail_status=guardrail_status,
             event_type=event_type,
-            tracing_detail=cast(GuardrailTracingDetail, {**tracing_detail, "skipped_policies": skipped})
+            tracing_detail=cast(
+                GuardrailTracingDetail,
+                {**tracing_detail, **self._skipped_tracing_detail(skipped)},
+            )
             if skipped
             else tracing_detail,
             start_time=started,
@@ -2082,6 +2086,54 @@ class XecGuardGuardrail(CustomGuardrail):
             for item in items
             if isinstance(item, dict) and item.get("policy_name")
         ]
+
+    @staticmethod
+    def _skipped_tracing_detail(skipped: Sequence[Mapping[str, str]]) -> dict[str, object]:
+        """The skipped policies in the fields the Logs page already draws: ``detection_method`` is
+        the badge on the guardrail row and survives spend log redaction, ``classification`` is the
+        panel that opens under it and is redacted unless prompts are stored."""
+        labels: Final = tuple(f"{item['policy_name']} ({item['reason']})" for item in skipped)
+        return {
+            "skipped_policies": list(skipped),
+            "detection_method": f"skipped: {' | '.join(labels)}",
+            "classification": {"category": "Skipped policies", "reason": "; ".join(labels)},
+        }
+
+    async def async_post_call_response_headers_hook(
+        self,
+        data: dict,
+        user_api_key_dict: Any,
+        response: object,
+        request_headers: dict[str, str] | None = None,
+        litellm_call_info: dict[str, object] | None = None,
+    ) -> dict[str, str] | None:
+        """``x-xecguard-skipped-policies`` on the response, so a caller sees that a policy it asked
+        for was never checked. Read from what the scans recorded, so every XecGuard guardrail
+        answers with the same value."""
+        skipped: Final = self._recorded_skipped_policies(data)
+        if not skipped:
+            return None
+        value: Final = ",".join(f"{item['policy_name']}:{item['reason']}" for item in skipped)
+        return {_SKIPPED_POLICIES_HEADER: "".join(ch for ch in value if " " <= ch <= "~")}
+
+    @staticmethod
+    def _recorded_skipped_policies(request_data: Mapping[str, Any]) -> tuple[dict[str, str], ...]:
+        entries: Final = tuple(
+            entry
+            for bucket in _METADATA_BUCKETS
+            for container in (request_data.get(bucket),)
+            if isinstance(container, dict)
+            for recorded in (container.get("standard_logging_guardrail_information"),)
+            if isinstance(recorded, list)
+            for entry in recorded
+            if isinstance(entry, dict)
+        )
+        seen: Final = {
+            (item["policy_name"], item["reason"]): item
+            for entry in entries
+            for item in XecGuardGuardrail._skipped_policies(entry)
+        }
+        return tuple(seen.values())
 
     def _request_context(self, request_data: Mapping[str, Any], scan_result: dict) -> dict[str, Any]:
         fields: Final = {
