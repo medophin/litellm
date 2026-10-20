@@ -135,19 +135,90 @@ class TestPollReadyRationales:
                 _trace(_reason()),
             ]
         )
-        assert await poll_ready_rationales(fetch, "t1", timeout_seconds=30, interval_seconds=0.001) == {POLICY: REAL}
+        assert await poll_ready_rationales(fetch, "t1", timeout_seconds=30, first_interval_seconds=0.001) == {
+            POLICY: REAL
+        }
         assert fetch.await_count == 3
 
     @pytest.mark.asyncio
     async def test_gives_back_what_was_ready_when_time_runs_out(self):
         other = "Default_Policy_HarmfulContentProtection"
         fetch = AsyncMock(return_value=_trace(_reason(), _reason(other, "ANALYSIS_REQUIRED", PLACEHOLDER)))
-        assert await poll_ready_rationales(fetch, "t1", timeout_seconds=0.05, interval_seconds=0.01) == {POLICY: REAL}
+        assert await poll_ready_rationales(fetch, "t1", timeout_seconds=0.05, first_interval_seconds=0.01) == {
+            POLICY: REAL
+        }
 
     @pytest.mark.asyncio
     async def test_returns_nothing_when_the_trace_never_loads(self):
         fetch = AsyncMock(return_value=None)
-        assert await poll_ready_rationales(fetch, "t1", timeout_seconds=0.05, interval_seconds=0.01) == {}
+        assert await poll_ready_rationales(fetch, "t1", timeout_seconds=0.05, first_interval_seconds=0.01) == {}
+
+
+class _FakeClock:
+    """A clock that only moves when the poll loop sleeps, so backoff is checked without waiting."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.waits: list[float] = []
+
+    def time(self) -> float:
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        self.waits.append(seconds)
+        self.now += seconds
+
+
+class TestPollBackoff:
+    @pytest.mark.asyncio
+    async def test_the_wait_doubles_up_to_the_cap_between_tries(self):
+        clock = _FakeClock()
+        fetch = AsyncMock(return_value=_trace(_reason(status="ANALYSIS_REQUIRED", rationale=PLACEHOLDER)))
+
+        await poll_ready_rationales(
+            fetch, "t1", timeout_seconds=200, first_interval_seconds=2.0, sleep=clock.sleep, now=clock.time
+        )
+
+        assert clock.waits[:6] == [2.0, 4.0, 8.0, 16.0, 30.0, 30.0]
+        assert max(clock.waits) == 30.0
+
+    @pytest.mark.asyncio
+    async def test_a_trace_that_is_still_missing_after_the_grace_period_is_given_up_on(self):
+        clock = _FakeClock()
+        fetch = AsyncMock(return_value=None)
+
+        result = await poll_ready_rationales(
+            fetch, "t1", timeout_seconds=600, first_interval_seconds=2.0, sleep=clock.sleep, now=clock.time
+        )
+
+        assert result == {}
+        assert 60 <= clock.now < 130
+        assert fetch.await_count < 12
+
+    @pytest.mark.asyncio
+    async def test_a_trace_that_appears_late_is_still_used(self):
+        clock = _FakeClock()
+        fetch = AsyncMock(side_effect=[None, None, None, _trace(_reason())])
+
+        result = await poll_ready_rationales(
+            fetch, "t1", timeout_seconds=600, first_interval_seconds=2.0, sleep=clock.sleep, now=clock.time
+        )
+
+        assert result == {POLICY: REAL}
+        assert fetch.await_count == 4
+
+    @pytest.mark.asyncio
+    async def test_stops_at_the_deadline_with_what_was_ready(self):
+        clock = _FakeClock()
+        other = "Default_Policy_HarmfulContentProtection"
+        fetch = AsyncMock(return_value=_trace(_reason(), _reason(other, "ANALYSIS_REQUIRED", PLACEHOLDER)))
+
+        result = await poll_ready_rationales(
+            fetch, "t1", timeout_seconds=20, first_interval_seconds=2.0, sleep=clock.sleep, now=clock.time
+        )
+
+        assert result == {POLICY: REAL}
+        assert clock.now <= 20
 
 
 class TestBackfillRationale:
@@ -160,7 +231,8 @@ class TestBackfillRationale:
             request_id="rid",
             trace_id="t1",
             timeout_seconds=5,
-            interval_seconds=0.001,
+            first_interval_seconds=0.001,
+            store_retry_seconds=0.001,
         )
         assert store.await_count == 3
         store.assert_awaited_with("rid", {POLICY: REAL})
@@ -174,7 +246,8 @@ class TestBackfillRationale:
             request_id="rid",
             trace_id="t1",
             timeout_seconds=5,
-            interval_seconds=0.001,
+            first_interval_seconds=0.001,
+            store_retry_seconds=0.001,
             store_attempts=3,
         )
         assert store.await_count == 3
@@ -188,7 +261,7 @@ class TestBackfillRationale:
             request_id="rid",
             trace_id="t1",
             timeout_seconds=5,
-            interval_seconds=0.001,
+            first_interval_seconds=0.001,
         )
         store.assert_not_awaited()
 
@@ -202,7 +275,7 @@ class TestBackfillRationale:
                 request_id=None,
                 trace_id="t1",
                 timeout_seconds=5,
-                interval_seconds=0.001,
+                first_interval_seconds=0.001,
             )
         store.assert_not_awaited()
         assert REAL in info.call_args.args[1]
@@ -266,7 +339,7 @@ class TestXecGuardBackfillsAPlaceholderRationale:
         assert violation["rationale"] == REAL
         assert prisma.db.execute_raw.await_args.args[1] == "rid-1"
         url = guardrail.async_handler.get.await_args.kwargs["url"]
-        assert url == "https://api.test.xecguard.local/xecguard/v1/trace/t1"
+        assert url == "https://api.test.xecguard.local/xecguard/v1/service/trace/t1"
 
     @pytest.mark.asyncio
     async def test_the_recorded_entry_and_the_decision_are_not_held_for_the_rationale(self):

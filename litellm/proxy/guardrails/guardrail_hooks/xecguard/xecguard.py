@@ -161,10 +161,11 @@ _LOGGED_SCAN_LABEL: Final = {"input": "request scan", "response": "response scan
 _DEFAULT_API_BASE: Final = "https://api-xecguard.cycraft.ai"
 _SCAN_ENDPOINT: Final = "/xecguard/v1/scan"
 _GROUNDING_ENDPOINT: Final = "/xecguard/v1/grounding"
-_TRACE_ENDPOINT: Final = "/xecguard/v1/trace"
+_TRACE_ENDPOINT: Final = "/xecguard/v1/service/trace"
 _SKIPPED_POLICIES_HEADER: Final = "x-xecguard-skipped-policies"
 _DEFAULT_RATIONALE_POLL_SECONDS: Final = 120.0
 _TRACE_DENIED_STATUSES: Final = frozenset({401, 403})
+_TRACE_NOT_FOUND_GRACE_SECONDS: Final = 60.0
 _NO_REQUEST_TEXT: Final = "(request text unavailable)"
 _DEFAULT_MODEL: Final = "xecguard_v2"
 _DEFAULT_CUSTOM_POLICY_MIN_CHARS: Final = 500
@@ -302,8 +303,10 @@ class _TextCapture(CustomGuardrail):
 
 _RATIONALE_READY: Final = "READY"
 _RATIONALE_PENDING: Final = "ANALYSIS_REQUIRED"
-_POLL_INTERVAL_SECONDS: Final = 2.0
+_POLL_FIRST_INTERVAL_SECONDS: Final = 2.0
+_POLL_MAX_INTERVAL_SECONDS: Final = 30.0
 _SPEND_LOG_ATTEMPTS: Final = 15
+_SPEND_LOG_RETRY_SECONDS: Final = 2.0
 _SPEND_LOG_LOOKBACK: Final = timedelta(hours=1)
 
 _FIND_SPEND_LOG_SQL: Final = """
@@ -394,21 +397,31 @@ def _patch_violation(violation: object, rationales: Mapping[str, str]) -> object
 
 
 async def _poll_ready_rationales(
-    fetch_trace: _FetchTrace, trace_id: str, timeout_seconds: float, interval_seconds: float
+    fetch_trace: _FetchTrace,
+    trace_id: str,
+    timeout_seconds: float,
+    first_interval_seconds: float,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    now: Callable[[], float] = time.monotonic,
 ) -> Mapping[str, str]:
-    """Poll the trace until every reason is READY or the time is up, keeping what was READY by then."""
-    loop: Final = asyncio.get_running_loop()
-    deadline: Final = loop.time() + timeout_seconds
+    """Poll the trace until every reason is READY or the time is up, keeping what was READY by then.
+    The wait doubles after each try up to ``_POLL_MAX_INTERVAL_SECONDS``, as the trace endpoint asks."""
+    started: Final = now()
+    deadline: Final = started + timeout_seconds
     ready: Mapping[str, str] = {}
+    interval = first_interval_seconds
     while True:
         trace = await fetch_trace(trace_id)
         if trace is not None:
             ready, complete = _ready_rationales(trace)
-            if complete or loop.time() + interval_seconds > deadline:
+            if complete:
                 return ready
-        elif loop.time() + interval_seconds > deadline:
+        elif not ready and now() - started >= _TRACE_NOT_FOUND_GRACE_SECONDS:
             return ready
-        await asyncio.sleep(interval_seconds)
+        if now() + interval > deadline:
+            return ready
+        await sleep(interval)
+        interval = min(interval * 2, _POLL_MAX_INTERVAL_SECONDS)
 
 
 async def _backfill_rationale(
@@ -418,12 +431,13 @@ async def _backfill_rationale(
     request_id: str | None,
     trace_id: str,
     timeout_seconds: float,
-    interval_seconds: float = _POLL_INTERVAL_SECONDS,
+    first_interval_seconds: float = _POLL_FIRST_INTERVAL_SECONDS,
+    store_retry_seconds: float = _SPEND_LOG_RETRY_SECONDS,
     store_attempts: int = _SPEND_LOG_ATTEMPTS,
     log_context: Mapping[str, object] | None = None,
 ) -> None:
     try:
-        rationales: Final = await _poll_ready_rationales(fetch_trace, trace_id, timeout_seconds, interval_seconds)
+        rationales: Final = await _poll_ready_rationales(fetch_trace, trace_id, timeout_seconds, first_interval_seconds)
         if not rationales:
             verbose_proxy_logger.warning("XecGuard rationale for trace_id=%s was not ready in time", trace_id)
             return
@@ -441,7 +455,7 @@ async def _backfill_rationale(
             if await store_rationale(request_id, rationales):
                 return
             if attempt + 1 < store_attempts:
-                await asyncio.sleep(interval_seconds)
+                await asyncio.sleep(store_retry_seconds)
         verbose_proxy_logger.warning("XecGuard rationale for trace_id=%s found no spend log row to update", trace_id)
     except Exception as exc:
         verbose_proxy_logger.warning("XecGuard rationale backfill for trace_id=%s failed: %s", trace_id, exc)
