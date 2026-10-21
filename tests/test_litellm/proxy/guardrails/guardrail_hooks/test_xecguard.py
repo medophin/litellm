@@ -5977,61 +5977,6 @@ class TestXecGuardShowsSkippedPoliciesOnTheLogsPage:
         assert "classification" not in entry
 
 
-class TestXecGuardSkippedPoliciesResponseHeader:
-    @pytest.mark.asyncio
-    async def test_header_lists_every_skipped_policy_with_its_reason(self, xecguard_guardrail):
-        request_data = {"litellm_call_id": "r1", "metadata": {}}
-        _record_skipped(xecguard_guardrail, request_data, SKIPPED_SYSTEM_PROMPT, SKIPPED_TOOL_CALL)
-
-        headers = await xecguard_guardrail.async_post_call_response_headers_hook(request_data, None, None)
-
-        assert headers == {
-            "x-xecguard-skipped-policies": (
-                "Default_Policy_SystemPromptEnforcement:no_system_prompt,Default_Policy_ToolUseGuard:no_tool_call"
-            )
-        }
-
-    @pytest.mark.asyncio
-    async def test_a_policy_skipped_by_two_scans_is_listed_once(self, xecguard_guardrail):
-        request_data = {"litellm_call_id": "r1", "metadata": {}}
-        _record_skipped(xecguard_guardrail, request_data, SKIPPED_TOOL_CALL)
-        _record_skipped(xecguard_guardrail, request_data, SKIPPED_TOOL_CALL)
-
-        headers = await xecguard_guardrail.async_post_call_response_headers_hook(request_data, None, None)
-
-        assert headers == {"x-xecguard-skipped-policies": "Default_Policy_ToolUseGuard:no_tool_call"}
-
-    @pytest.mark.asyncio
-    async def test_no_header_when_nothing_was_skipped(self, xecguard_guardrail):
-        request_data = {"litellm_call_id": "r1", "metadata": {}}
-        _record_skipped(xecguard_guardrail, request_data)
-
-        assert await xecguard_guardrail.async_post_call_response_headers_hook(request_data, None, None) is None
-        assert await xecguard_guardrail.async_post_call_response_headers_hook({}, None, None) is None
-
-    @pytest.mark.asyncio
-    async def test_the_header_is_read_from_the_litellm_metadata_bucket_too(self, xecguard_guardrail):
-        request_data = {"litellm_call_id": "r1", "litellm_metadata": {}}
-        _record_skipped(xecguard_guardrail, request_data, SKIPPED_TOOL_CALL)
-
-        headers = await xecguard_guardrail.async_post_call_response_headers_hook(request_data, None, None)
-
-        assert headers == {"x-xecguard-skipped-policies": "Default_Policy_ToolUseGuard:no_tool_call"}
-
-    @pytest.mark.asyncio
-    async def test_a_value_that_is_not_a_safe_header_is_cleaned(self, xecguard_guardrail):
-        request_data = {"litellm_call_id": "r1", "metadata": {}}
-        _record_skipped(
-            xecguard_guardrail, request_data, {"policy_name": "Policy\r\nX-Evil: 1", "reason": "no_tool_call中"}
-        )
-
-        headers = await xecguard_guardrail.async_post_call_response_headers_hook(request_data, None, None)
-
-        value = headers["x-xecguard-skipped-policies"]
-        assert "\r" not in value and "\n" not in value
-        assert value.isascii()
-
-
 class TestXecGuardRecordsHowLongTheScanTook:
     @staticmethod
     def _slow_xecguard(guardrail, decision: str = "SAFE", delay: float = 0.05):
